@@ -19,7 +19,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -131,7 +130,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.DefaultItemAnimator
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
 import java.io.File
 import kotlin.math.cos
 import kotlin.math.sin
@@ -508,6 +514,15 @@ class MainViewModel(
         saveQuickSubtitleConfig()
     }
 
+    fun setQuickSubtitleItems(groupIndex: Int, items: List<String>) {
+        if (groupIndex !in quickSubtitleGroups.indices) return
+        val g = quickSubtitleGroups[groupIndex]
+        val next = quickSubtitleGroups.toMutableList()
+        next[groupIndex] = g.copy(items = items.toList())
+        quickSubtitleGroups = next
+        saveQuickSubtitleConfig()
+    }
+
     private fun ensureController(): RealtimeController {
         controller?.let { return it }
         val created = RealtimeController(
@@ -738,10 +753,14 @@ class MainViewModel(
     }
 
     fun reorderVoicePacks(newOrder: List<VoicePackInfo>) {
+        // Optimistically apply UI order to avoid one-frame fallback to stale state.
+        uiState = uiState.copy(voicePacks = newOrder)
         viewModelScope.launch {
-            newOrder.forEachIndexed { index, pack ->
-                repo.updateVoiceMeta(pack.dir) { meta ->
-                    meta.copy(order = index.toLong())
+            withContext(Dispatchers.IO) {
+                newOrder.forEachIndexed { index, pack ->
+                    repo.updateVoiceMeta(pack.dir) { meta ->
+                        meta.copy(order = index.toLong())
+                    }
                 }
             }
             refreshVoicePacks()
@@ -1262,6 +1281,11 @@ private data class DrawerItem(
     val icon: String
 )
 
+private object QuickSubtitleRoutes {
+    const val Main = "quick_subtitle/main"
+    const val Editor = "quick_subtitle/editor"
+}
+
 class MainActivity : ComponentActivity() {
     private val viewModel: MainViewModel by viewModels {
         val repo = ModelRepository(this@MainActivity)
@@ -1476,11 +1500,13 @@ fun AppScaffold(viewModel: MainViewModel) {
     val pageDrawing = 4
     val pageSettings = 5
     val pageLog = 6
-    val pageQuickSubtitleEditor = 7
 
     var page by rememberSaveable { mutableStateOf(0) }
     var drawingFullscreen by rememberSaveable { mutableStateOf(false) }
     var runningStripCollapsed by rememberSaveable { mutableStateOf(false) }
+    val quickSubtitleNavController = rememberNavController()
+    val quickSubtitleBackStackEntry by quickSubtitleNavController.currentBackStackEntryAsState()
+    val quickSubtitleRoute = quickSubtitleBackStackEntry?.destination?.route ?: QuickSubtitleRoutes.Main
     val state = viewModel.uiState
     val context = LocalContext.current
     val activity = context as? Activity
@@ -1523,11 +1549,9 @@ fun AppScaffold(viewModel: MainViewModel) {
     }
     val usePermanentDrawer =
         isLandscape && state.landscapeDrawerMode == UserPrefs.DRAWER_MODE_PERMANENT
-    val editorOverlayOpen = page == pageQuickSubtitleEditor
-    val basePage = if (editorOverlayOpen) pageQuickSubtitle else page
-    BackHandler(enabled = editorOverlayOpen) {
-        page = pageQuickSubtitle
-    }
+    val basePage = page
+    val quickSubtitleEditorOpen =
+        basePage == pageQuickSubtitle && quickSubtitleRoute == QuickSubtitleRoutes.Editor
     var drawerExpanded by rememberSaveable { mutableStateOf(false) }
     val showRunningStrip = state.running && !(drawingFullscreen && basePage == pageDrawing)
     val topMicLevel = viewModel.realtimeInputLevel
@@ -1544,8 +1568,13 @@ fun AppScaffold(viewModel: MainViewModel) {
     val titles = drawerItems.map { it.title }
     val drawerSelectedPage = basePage
     LaunchedEffect(drawerItems.size) {
-        if (page !in 0..pageQuickSubtitleEditor) {
+        if (page !in 0..pageLog) {
             page = pageRealtime
+        }
+    }
+    LaunchedEffect(basePage, quickSubtitleRoute) {
+        if (basePage != pageQuickSubtitle && quickSubtitleRoute != QuickSubtitleRoutes.Main) {
+            quickSubtitleNavController.popBackStack(QuickSubtitleRoutes.Main, inclusive = false)
         }
     }
     LaunchedEffect(page) {
@@ -1581,7 +1610,11 @@ fun AppScaffold(viewModel: MainViewModel) {
     }
 
     val topBar: @Composable ((() -> Unit)) -> Unit = { onNavClick ->
-        val currentTitle = titles.getOrElse(basePage) { "KGTTS" }
+        val currentTitle = if (quickSubtitleEditorOpen) {
+            "编辑便捷字幕"
+        } else {
+            titles.getOrElse(basePage) { "KGTTS" }
+        }
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1623,8 +1656,14 @@ fun AppScaffold(viewModel: MainViewModel) {
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onNavClick) {
-                        MsIcon("menu", contentDescription = "打开菜单")
+                    if (quickSubtitleEditorOpen) {
+                        IconButton(onClick = { quickSubtitleNavController.popBackStack() }) {
+                            MsIcon("arrow_back", contentDescription = "返回")
+                        }
+                    } else {
+                        IconButton(onClick = onNavClick) {
+                            MsIcon("menu", contentDescription = "打开菜单")
+                        }
                     }
                 },
                 actions = {
@@ -1684,11 +1723,11 @@ fun AppScaffold(viewModel: MainViewModel) {
             ) { current ->
                 when (current) {
                     pageRealtime -> RealtimeScreen(viewModel, state)
-                    pageQuickSubtitle -> QuickSubtitleScreen(
+                    pageQuickSubtitle -> QuickSubtitleNavHost(
+                        navController = quickSubtitleNavController,
                         viewModel = viewModel,
                         state = state,
-                        onToggleMic = onToggleRun,
-                        onOpenEditor = { page = pageQuickSubtitleEditor }
+                        onToggleMic = onToggleRun
                     )
                     pageTextToSpeech -> TextToSpeechScreen(viewModel, state)
                     pageVoicePack -> VoicePackScreen(viewModel, state)
@@ -1929,56 +1968,6 @@ fun AppScaffold(viewModel: MainViewModel) {
                         )
                     }
                 }
-            }
-        }
-
-        AnimatedVisibility(
-            visible = editorOverlayOpen,
-            modifier = Modifier
-                .matchParentSize()
-                .zIndex(50f),
-            enter = fadeIn(animationSpec = tween(180)) +
-                    androidx.compose.animation.slideInHorizontally(
-                        initialOffsetX = { full -> full / 3 },
-                        animationSpec = tween(220, easing = FastOutSlowInEasing)
-                    ),
-            exit = fadeOut(animationSpec = tween(120)) +
-                    androidx.compose.animation.slideOutHorizontally(
-                        targetOffsetX = { full -> full / 4 },
-                        animationSpec = tween(180, easing = FastOutSlowInEasing)
-                    )
-        ) {
-            Scaffold(
-                topBar = {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .then(if (!inMultiWindowMode) Modifier.statusBarsPadding() else Modifier)
-                            .padding(top = miuiFloatingTopCompensation),
-                        color = topBarColor,
-                        elevation = UiTokens.TopBarElevation
-                    ) {
-                        TopAppBar(
-                            title = { Text("编辑便捷字幕") },
-                            navigationIcon = {
-                                IconButton(onClick = { page = pageQuickSubtitle }) {
-                                    MsIcon("arrow_back", contentDescription = "返回")
-                                }
-                            },
-                            backgroundColor = Color.Transparent,
-                            contentColor = topBarContentColor,
-                            elevation = 0.dp
-                        )
-                    }
-                },
-                backgroundColor = MaterialTheme.colorScheme.background
-            ) { innerPadding ->
-                QuickSubtitleEditorScreen(
-                    viewModel = viewModel,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(innerPadding)
-                )
             }
         }
     }
@@ -2462,25 +2451,32 @@ private fun VoicePackRecyclerList(
                     if (actionState == ItemTouchHelper.ACTION_STATE_DRAG && viewHolder != null) {
                         if (activeViewHolder !== viewHolder) {
                             activeViewHolder?.let { animateDragElevation(it.itemView, elevated = false) }
+                            (activeViewHolder as? VoicePackRecyclerAdapter.VoicePackViewHolder)?.setDragged(false)
                         }
                         activeViewHolder = viewHolder
+                        (viewHolder as? VoicePackRecyclerAdapter.VoicePackViewHolder)?.setDragged(true)
                         animateDragElevation(viewHolder.itemView, elevated = true)
                     } else if (actionState == ItemTouchHelper.ACTION_STATE_IDLE) {
                         activeViewHolder?.let { animateDragElevation(it.itemView, elevated = false) }
+                        (activeViewHolder as? VoicePackRecyclerAdapter.VoicePackViewHolder)?.setDragged(false)
                         activeViewHolder = null
                     }
-                    adapter.isDragging = actionState == ItemTouchHelper.ACTION_STATE_DRAG
+                    // Keep drag-lock until clearView so stale state cannot overwrite moved order.
+                    if (actionState == ItemTouchHelper.ACTION_STATE_DRAG) {
+                        adapter.isDragging = true
+                    }
                 }
 
                 override fun clearView(recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder) {
                     super.clearView(recyclerView, viewHolder)
                     animateDragElevation(viewHolder.itemView, elevated = false)
+                    (viewHolder as? VoicePackRecyclerAdapter.VoicePackViewHolder)?.setDragged(false)
                     if (activeViewHolder === viewHolder) activeViewHolder = null
-                    adapter.isDragging = false
                     if (moved) {
                         onReorderState.value(adapter.snapshot())
                         moved = false
                     }
+                    adapter.isDragging = false
                 }
             }
             val touchHelper = ItemTouchHelper(touchCallback)
@@ -2542,6 +2538,7 @@ private class VoicePackRecyclerAdapter(
         if (!isDragging) {
             holder.itemView.translationZ = 0f
         }
+        holder.setDragged(false)
         val pack = items[position]
         holder.bind(
             pack = pack,
@@ -2560,6 +2557,12 @@ private class VoicePackRecyclerAdapter(
     }
 
     override fun getItemCount(): Int = items.size
+
+    override fun onViewRecycled(holder: VoicePackViewHolder) {
+        holder.setDragged(false)
+        holder.itemView.translationZ = 0f
+        super.onViewRecycled(holder)
+    }
 
     fun submitFromState(newItems: List<VoicePackInfo>) {
         if (isDragging) return
@@ -2584,6 +2587,12 @@ private class VoicePackRecyclerAdapter(
     class VoicePackViewHolder(
         private val composeView: ComposeView
     ) : RecyclerView.ViewHolder(composeView) {
+        private val draggedState = mutableStateOf(false)
+
+        fun setDragged(dragged: Boolean) {
+            draggedState.value = dragged
+        }
+
         fun bind(
             pack: VoicePackInfo,
             isCurrent: Boolean,
@@ -2598,6 +2607,7 @@ private class VoicePackRecyclerAdapter(
                 VoicePackCardContent(
                     pack = pack,
                     isCurrent = isCurrent,
+                    isDragged = draggedState.value,
                     onSelect = { onSelect(pack) },
                     onTogglePin = { onTogglePin(pack) },
                     onDetail = { onDetail(pack) },
@@ -2615,6 +2625,7 @@ private class VoicePackRecyclerAdapter(
 private fun VoicePackCardContent(
     pack: VoicePackInfo,
     isCurrent: Boolean,
+    isDragged: Boolean,
     onSelect: () -> Unit,
     onTogglePin: () -> Unit,
     onDetail: () -> Unit,
@@ -2624,12 +2635,20 @@ private fun VoicePackCardContent(
 ) {
     val avatarFile = File(pack.dir, pack.meta.avatar)
     val avatarBitmap = rememberAvatarBitmap(avatarFile)
+    val cardElevation by animateDpAsState(
+        targetValue = if (isDragged) 10.dp else UiTokens.CardElevation,
+        animationSpec = tween(
+            durationMillis = if (isDragged) 120 else 160,
+            easing = FastOutSlowInEasing
+        ),
+        label = "voice_pack_card_elevation"
+    )
 
     Box(modifier = Modifier.padding(horizontal = 2.dp, vertical = 6.dp)) {
         Card(
             shape = RoundedCornerShape(UiTokens.Radius),
             backgroundColor = md2CardContainerColor(),
-            elevation = UiTokens.CardElevation
+            elevation = cardElevation
         ) {
             Column {
                 Row(
@@ -2746,6 +2765,87 @@ private fun animateDragElevation(view: View, elevated: Boolean) {
         .setDuration(duration)
         .setInterpolator(FastOutSlowInInterpolator())
         .start()
+}
+
+@Composable
+private fun QuickSubtitleNavHost(
+    navController: NavHostController,
+    viewModel: MainViewModel,
+    state: UiState,
+    onToggleMic: () -> Unit
+) {
+    NavHost(
+        navController = navController,
+        startDestination = QuickSubtitleRoutes.Main,
+        modifier = Modifier.fillMaxSize(),
+        enterTransition = {
+            if (initialState.destination.route == QuickSubtitleRoutes.Main &&
+                targetState.destination.route == QuickSubtitleRoutes.Editor
+            ) {
+                fadeIn(animationSpec = tween(180)) +
+                        androidx.compose.animation.slideInHorizontally(
+                            initialOffsetX = { full -> full / 3 },
+                            animationSpec = tween(220, easing = FastOutSlowInEasing)
+                        )
+            } else {
+                fadeIn(animationSpec = tween(120))
+            }
+        },
+        exitTransition = {
+            if (initialState.destination.route == QuickSubtitleRoutes.Main &&
+                targetState.destination.route == QuickSubtitleRoutes.Editor
+            ) {
+                fadeOut(animationSpec = tween(120)) +
+                        androidx.compose.animation.slideOutHorizontally(
+                            targetOffsetX = { full -> -full / 6 },
+                            animationSpec = tween(180, easing = FastOutSlowInEasing)
+                        )
+            } else {
+                fadeOut(animationSpec = tween(90))
+            }
+        },
+        popEnterTransition = {
+            if (initialState.destination.route == QuickSubtitleRoutes.Editor &&
+                targetState.destination.route == QuickSubtitleRoutes.Main
+            ) {
+                fadeIn(animationSpec = tween(160)) +
+                        androidx.compose.animation.slideInHorizontally(
+                            initialOffsetX = { full -> -full / 4 },
+                            animationSpec = tween(180, easing = FastOutSlowInEasing)
+                        )
+            } else {
+                fadeIn(animationSpec = tween(120))
+            }
+        },
+        popExitTransition = {
+            if (initialState.destination.route == QuickSubtitleRoutes.Editor &&
+                targetState.destination.route == QuickSubtitleRoutes.Main
+            ) {
+                fadeOut(animationSpec = tween(120)) +
+                        androidx.compose.animation.slideOutHorizontally(
+                            targetOffsetX = { full -> full / 4 },
+                            animationSpec = tween(180, easing = FastOutSlowInEasing)
+                        )
+            } else {
+                fadeOut(animationSpec = tween(90))
+            }
+        }
+    ) {
+        composable(QuickSubtitleRoutes.Main) {
+            QuickSubtitleScreen(
+                viewModel = viewModel,
+                state = state,
+                onToggleMic = onToggleMic,
+                onOpenEditor = { navController.navigate(QuickSubtitleRoutes.Editor) }
+            )
+        }
+        composable(QuickSubtitleRoutes.Editor) {
+            QuickSubtitleEditorScreen(
+                viewModel = viewModel,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
 }
 
 @Composable
@@ -3297,96 +3397,418 @@ private fun QuickSubtitleEditorScreen(
         }
 
         if (selectedGroup != null) {
-            item(key = "items_header") {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(UiTokens.Radius),
-                    backgroundColor = md2CardContainerColor(),
-                    elevation = UiTokens.CardElevation
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("快捷文本", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        Md2TextButton(onClick = { viewModel.addQuickSubtitleItem(selectedGroupIndex) }) {
-                            MsIcon("add", contentDescription = "新增文本")
-                            Spacer(Modifier.width(4.dp))
-                            Text("新增")
-                        }
+            item(key = "items_card") {
+                QuickSubtitleItemsRecyclerCard(
+                    items = selectedGroup.items,
+                    onAdd = { viewModel.addQuickSubtitleItem(selectedGroupIndex) },
+                    onItemsChanged = { reordered ->
+                        viewModel.setQuickSubtitleItems(selectedGroupIndex, reordered)
+                    },
+                    onItemTextChanged = { itemIndex, value ->
+                        viewModel.updateQuickSubtitleItem(selectedGroupIndex, itemIndex, value)
                     }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickSubtitleItemsRecyclerCard(
+    items: List<String>,
+    onAdd: () -> Unit,
+    onItemsChanged: (List<String>) -> Unit,
+    onItemTextChanged: (Int, String) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(UiTokens.Radius),
+        backgroundColor = md2CardContainerColor(),
+        elevation = UiTokens.CardElevation
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("快捷文本", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Md2TextButton(onClick = onAdd) {
+                    MsIcon("add", contentDescription = "新增文本")
+                    Spacer(Modifier.width(4.dp))
+                    Text("新增")
+                }
+            }
+            QuickSubtitleItemsRecyclerList(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 92.dp)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                items = items,
+                onItemsChanged = onItemsChanged,
+                onItemTextChanged = onItemTextChanged
+            )
+        }
+    }
+}
+
+@Composable
+private fun QuickSubtitleItemsRecyclerList(
+    modifier: Modifier = Modifier,
+    items: List<String>,
+    onItemsChanged: (List<String>) -> Unit,
+    onItemTextChanged: (Int, String) -> Unit
+) {
+    val parentComposition = rememberCompositionContext()
+    val onItemsChangedState = rememberUpdatedState(onItemsChanged)
+    val onItemTextChangedState = rememberUpdatedState(onItemTextChanged)
+
+    AndroidView(
+        modifier = modifier,
+        factory = { ctx ->
+            val recycler = RecyclerView(ctx).apply {
+                layoutManager = LinearLayoutManager(ctx)
+                overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                clipToPadding = false
+                clipChildren = false
+                isNestedScrollingEnabled = false
+                itemAnimator = DefaultItemAnimator().apply {
+                    supportsChangeAnimations = false
+                    addDuration = 120L
+                    removeDuration = 120L
+                    moveDuration = 160L
+                    changeDuration = 0L
                 }
             }
 
-            itemsIndexed(
-                items = selectedGroup.items,
-                key = { idx, _ -> "${selectedGroup.id}-$idx" }
-            ) { itemIndex, item ->
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(UiTokens.Radius),
-                    backgroundColor = md2CardContainerColor(),
-                    elevation = UiTokens.CardElevation
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = item,
-                            onValueChange = {
-                                viewModel.updateQuickSubtitleItem(selectedGroupIndex, itemIndex, it)
-                            },
-                            modifier = Modifier.weight(1f),
-                            singleLine = false,
-                            maxLines = 2,
-                            shape = RoundedCornerShape(UiTokens.Radius),
-                            colors = TextFieldDefaults.outlinedTextFieldColors(
-                                focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                                focusedLabelColor = MaterialTheme.colorScheme.primary,
-                                unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                cursorColor = MaterialTheme.colorScheme.primary
-                            )
-                        )
-                        Column {
-                            Md2IconButton(
-                                icon = "arrow_upward",
-                                contentDescription = "上移",
-                                onClick = {
-                                    if (itemIndex > 0) {
-                                        viewModel.moveQuickSubtitleItem(selectedGroupIndex, itemIndex, itemIndex - 1)
-                                    }
-                                },
-                                enabled = itemIndex > 0
-                            )
-                            Md2IconButton(
-                                icon = "arrow_downward",
-                                contentDescription = "下移",
-                                onClick = {
-                                    if (itemIndex < selectedGroup.items.lastIndex) {
-                                        viewModel.moveQuickSubtitleItem(selectedGroupIndex, itemIndex, itemIndex + 1)
-                                    }
-                                },
-                                enabled = itemIndex < selectedGroup.items.lastIndex
-                            )
-                        }
-                        Md2IconButton(
-                            icon = "delete",
-                            contentDescription = "删除文本",
-                            onClick = {
-                                viewModel.removeQuickSubtitleItem(selectedGroupIndex, itemIndex)
-                            },
-                            enabled = selectedGroup.items.size > 1
-                        )
+            val adapter = QuickSubtitleItemRecyclerAdapter(
+                parentComposition = parentComposition,
+                onItemsChanged = { changed -> onItemsChangedState.value(changed) },
+                onItemTextChanged = { index, value -> onItemTextChangedState.value(index, value) }
+            )
+            recycler.adapter = adapter
+
+            val touchCallback = object : ItemTouchHelper.Callback() {
+                private var activeViewHolder: RecyclerView.ViewHolder? = null
+                private var moved = false
+
+                override fun isLongPressDragEnabled(): Boolean = false
+                override fun isItemViewSwipeEnabled(): Boolean = false
+
+                override fun getMovementFlags(
+                    recyclerView: RecyclerView,
+                    viewHolder: RecyclerView.ViewHolder
+                ): Int {
+                    val dragFlags = ItemTouchHelper.UP or ItemTouchHelper.DOWN
+                    return makeMovementFlags(dragFlags, 0)
+                }
+
+                override fun onMove(
+                    recyclerView: RecyclerView,
+                    viewHolder: RecyclerView.ViewHolder,
+                    target: RecyclerView.ViewHolder
+                ): Boolean {
+                    val from = viewHolder.bindingAdapterPosition
+                    val to = target.bindingAdapterPosition
+                    val ok = adapter.move(from, to)
+                    moved = moved || ok
+                    return ok
+                }
+
+                override fun onSwiped(viewHolder: RecyclerView.ViewHolder, direction: Int) = Unit
+
+                override fun onSelectedChanged(viewHolder: RecyclerView.ViewHolder?, actionState: Int) {
+                    super.onSelectedChanged(viewHolder, actionState)
+                    if (actionState == ItemTouchHelper.ACTION_STATE_DRAG && viewHolder != null) {
+                        if (activeViewHolder !== viewHolder) activeViewHolder = viewHolder
+                        activeViewHolder = viewHolder
+                        adapter.setDraggingPosition(viewHolder.bindingAdapterPosition)
+                    } else if (actionState == ItemTouchHelper.ACTION_STATE_IDLE) {
+                        activeViewHolder = null
+                        adapter.clearDraggingItem()
+                    }
+                    adapter.isDragging = actionState == ItemTouchHelper.ACTION_STATE_DRAG
+                }
+
+                override fun clearView(recyclerView: RecyclerView, viewHolder: RecyclerView.ViewHolder) {
+                    super.clearView(recyclerView, viewHolder)
+                    if (activeViewHolder === viewHolder) activeViewHolder = null
+                    adapter.isDragging = false
+                    adapter.clearDraggingItem()
+                    if (moved) {
+                        onItemsChangedState.value(adapter.snapshotTexts())
+                        moved = false
                     }
                 }
             }
+            val touchHelper = ItemTouchHelper(touchCallback)
+            touchHelper.attachToRecyclerView(recycler)
+            adapter.onStartDrag = { vh -> touchHelper.startDrag(vh) }
+            recycler
+        },
+        update = { recycler ->
+            val adapter = recycler.adapter as? QuickSubtitleItemRecyclerAdapter ?: return@AndroidView
+            adapter.submitFromState(items)
+        }
+    )
+}
+
+private data class QuickSubtitleEditableItem(
+    val id: Long,
+    var text: String
+)
+
+private class QuickSubtitleItemRecyclerAdapter(
+    private val parentComposition: CompositionContext,
+    private val onItemsChanged: (List<String>) -> Unit,
+    private val onItemTextChanged: (Int, String) -> Unit
+) : RecyclerView.Adapter<QuickSubtitleItemRecyclerAdapter.ItemViewHolder>() {
+
+    private val items = mutableListOf<QuickSubtitleEditableItem>()
+    private var nextId = 1L
+    var isDragging: Boolean = false
+    var onStartDrag: ((RecyclerView.ViewHolder) -> Unit)? = null
+    private var draggingItemId: Long? = null
+
+    init {
+        setHasStableIds(true)
+    }
+
+    override fun getItemId(position: Int): Long = items[position].id
+
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ItemViewHolder {
+        val composeView = ComposeView(parent.context).apply {
+            layoutParams = RecyclerView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindowOrReleasedFromPool)
+            setParentCompositionContext(parentComposition)
+        }
+        return ItemViewHolder(composeView)
+    }
+
+    override fun getItemCount(): Int = items.size
+
+    override fun onBindViewHolder(holder: ItemViewHolder, position: Int) {
+        if (!isDragging) {
+            holder.itemView.translationZ = 0f
+        }
+        val row = items[position]
+        holder.bind(
+            itemId = row.id,
+            text = row.text,
+            isDragged = draggingItemId == row.id,
+            canDelete = items.size > 1,
+            onUpdate = { value ->
+                val idx = holder.bindingAdapterPosition
+                if (idx in items.indices) {
+                    items[idx].text = value
+                    onItemTextChanged(idx, value)
+                }
+            },
+            onDelete = {
+                val idx = holder.bindingAdapterPosition
+                if (idx in items.indices && items.size > 1) {
+                    items.removeAt(idx)
+                    notifyItemRemoved(idx)
+                    onItemsChanged(snapshotTexts())
+                }
+            },
+            onStartDrag = {
+                if (holder.bindingAdapterPosition != RecyclerView.NO_POSITION) {
+                    onStartDrag?.invoke(holder)
+                }
+            }
+        )
+    }
+
+    fun submitFromState(newItems: List<String>) {
+        if (isDragging) return
+        val oldItems = items.toList()
+        val used = BooleanArray(oldItems.size)
+        val mapped = ArrayList<QuickSubtitleEditableItem>(newItems.size)
+
+        for (text in newItems) {
+            var matchedIndex = -1
+            for (i in oldItems.indices) {
+                if (!used[i] && oldItems[i].text == text) {
+                    matchedIndex = i
+                    break
+                }
+            }
+            if (matchedIndex >= 0) {
+                used[matchedIndex] = true
+                mapped += oldItems[matchedIndex].copy(text = text)
+            } else {
+                mapped += QuickSubtitleEditableItem(id = nextId++, text = text)
+            }
+        }
+
+        val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+            override fun getOldListSize(): Int = oldItems.size
+            override fun getNewListSize(): Int = mapped.size
+
+            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                return oldItems[oldItemPosition].id == mapped[newItemPosition].id
+            }
+
+            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+                return oldItems[oldItemPosition].text == mapped[newItemPosition].text
+            }
+        })
+
+        items.clear()
+        items.addAll(mapped)
+        if (draggingItemId != null && items.none { it.id == draggingItemId }) {
+            draggingItemId = null
+        }
+        diff.dispatchUpdatesTo(this)
+    }
+
+    fun move(from: Int, to: Int): Boolean {
+        if (from == to || from !in items.indices || to !in items.indices) return false
+        val moved = items.removeAt(from)
+        items.add(to, moved)
+        notifyItemMoved(from, to)
+        return true
+    }
+
+    fun snapshotTexts(): List<String> = items.map { it.text }
+
+    fun setDraggingPosition(position: Int) {
+        val targetId = items.getOrNull(position)?.id
+        if (draggingItemId == targetId) return
+        val oldId = draggingItemId
+        draggingItemId = targetId
+        oldId?.let { id ->
+            val idx = items.indexOfFirst { it.id == id }
+            if (idx >= 0) notifyItemChanged(idx)
+        }
+        targetId?.let { id ->
+            val idx = items.indexOfFirst { it.id == id }
+            if (idx >= 0) notifyItemChanged(idx)
+        }
+    }
+
+    fun clearDraggingItem() {
+        val oldId = draggingItemId ?: return
+        draggingItemId = null
+        val idx = items.indexOfFirst { it.id == oldId }
+        if (idx >= 0) notifyItemChanged(idx)
+    }
+
+    class ItemViewHolder(
+        private val composeView: ComposeView
+    ) : RecyclerView.ViewHolder(composeView) {
+        fun bind(
+            itemId: Long,
+            text: String,
+            isDragged: Boolean,
+            canDelete: Boolean,
+            onUpdate: (String) -> Unit,
+            onDelete: () -> Unit,
+            onStartDrag: () -> Unit
+        ) {
+            composeView.setContent {
+                QuickSubtitleEditableRow(
+                    itemId = itemId,
+                    value = text,
+                    isDragged = isDragged,
+                    canDelete = canDelete,
+                    onUpdate = onUpdate,
+                    onDelete = onDelete,
+                    onStartDrag = onStartDrag
+                )
+            }
+        }
+    }
+}
+
+@Composable
+@OptIn(ExperimentalComposeUiApi::class)
+private fun QuickSubtitleEditableRow(
+    itemId: Long,
+    value: String,
+    isDragged: Boolean,
+    canDelete: Boolean,
+    onUpdate: (String) -> Unit,
+    onDelete: () -> Unit,
+    onStartDrag: () -> Unit
+) {
+    var textValue by remember(itemId) { mutableStateOf(value) }
+    LaunchedEffect(value) {
+        if (value != textValue) {
+            textValue = value
+        }
+    }
+
+    val rowElevation by animateDpAsState(
+        targetValue = if (isDragged) 10.dp else 0.dp,
+        animationSpec = tween(
+            durationMillis = if (isDragged) 120 else 160,
+            easing = FastOutSlowInEasing
+        ),
+        label = "quick_subtitle_item_elevation"
+    )
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 2.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(UiTokens.Radius),
+        backgroundColor = md2CardContainerColor(),
+        elevation = rowElevation
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            OutlinedTextField(
+                value = textValue,
+                onValueChange = {
+                    textValue = it
+                    onUpdate(it)
+                },
+                modifier = Modifier.weight(1f),
+                singleLine = false,
+                maxLines = 2,
+                shape = RoundedCornerShape(UiTokens.Radius),
+                colors = TextFieldDefaults.outlinedTextFieldColors(
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                    focusedLabelColor = MaterialTheme.colorScheme.primary,
+                    unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    cursorColor = MaterialTheme.colorScheme.primary
+                )
+            )
+            Md2IconButton(
+                icon = "drag_indicator",
+                contentDescription = "拖动排序",
+                onClick = {},
+                modifier = Modifier.pointerInteropFilter { ev ->
+                    when (ev.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            onStartDrag()
+                            true
+                        }
+                        MotionEvent.ACTION_MOVE,
+                        MotionEvent.ACTION_UP,
+                        MotionEvent.ACTION_CANCEL -> true
+                        else -> false
+                    }
+                }
+            )
+            Md2IconButton(
+                icon = "delete",
+                contentDescription = "删除文本",
+                onClick = onDelete,
+                enabled = canDelete
+            )
         }
     }
 }
