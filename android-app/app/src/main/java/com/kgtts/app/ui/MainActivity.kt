@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Paint
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
@@ -14,9 +16,11 @@ import android.view.Surface
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -25,12 +29,16 @@ import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -42,6 +50,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -70,13 +80,17 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.semantics.contentDescription
@@ -124,6 +138,7 @@ import com.kgtts.app.service.KeepAliveService
 import com.kgtts.app.util.AppLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -138,13 +153,37 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import java.io.FileOutputStream
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.cos
 import kotlin.math.sin
 
 private fun isXiaomiFamilyDevice(): Boolean {
     val m = Build.MANUFACTURER?.lowercase() ?: return false
     return m.contains("xiaomi") || m.contains("redmi") || m.contains("poco")
+}
+
+private fun softInputModeSummary(mode: Int): String {
+    val adjust = when (mode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST) {
+        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE -> "resize"
+        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN -> "pan"
+        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING -> "nothing"
+        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED -> "unspecified"
+        else -> "unknown"
+    }
+    val state = when (mode and WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE) {
+        WindowManager.LayoutParams.SOFT_INPUT_STATE_UNSPECIFIED -> "unspecified"
+        WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED -> "unchanged"
+        WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN -> "hidden"
+        WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN -> "always_hidden"
+        WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE -> "visible"
+        WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE -> "always_visible"
+        else -> "unknown"
+    }
+    return "adjust=$adjust,state=$state,raw=0x${mode.toString(16)}"
 }
 
 data class UiState(
@@ -910,6 +949,71 @@ class MainViewModel(
         )
     }
 
+    fun saveDrawingSnapshot() {
+        val strokes = drawStrokes.toList()
+        if (strokes.isEmpty()) {
+            uiState = uiState.copy(status = "画板为空，无可保存内容")
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                val width = 1080
+                val height = 1920
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = android.graphics.Canvas(bitmap)
+                canvas.drawColor(android.graphics.Color.WHITE)
+
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    style = Paint.Style.STROKE
+                    strokeCap = Paint.Cap.ROUND
+                    strokeJoin = Paint.Join.ROUND
+                }
+
+                strokes.forEach { stroke ->
+                    paint.color = if (stroke.eraser) android.graphics.Color.WHITE else stroke.color.toArgb()
+                    paint.strokeWidth = stroke.width
+                    val pts = stroke.points
+                    for (i in 1 until pts.size) {
+                        val p0 = pts[i - 1]
+                        val p1 = pts[i]
+                        canvas.drawLine(
+                            p0.x * width,
+                            p0.y * height,
+                            p1.x * width,
+                            p1.y * height,
+                            paint
+                        )
+                    }
+                }
+
+                val saveDir = appContext.getExternalFilesDir("drawings")
+                    ?: File(appContext.filesDir, "drawings")
+                if (!saveDir.exists()) {
+                    saveDir.mkdirs()
+                }
+                val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val outFile = File(saveDir, "drawing_$ts.png")
+                FileOutputStream(outFile).use { fos ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                }
+                bitmap.recycle()
+                outFile
+            }
+
+            result.onSuccess { file ->
+                AppLogger.i("drawing saved: ${file.absolutePath}")
+                withContext(Dispatchers.Main) {
+                    uiState = uiState.copy(status = "画板已保存：${file.name}")
+                }
+            }.onFailure { e ->
+                AppLogger.e("drawing save failed", e)
+                withContext(Dispatchers.Main) {
+                    uiState = uiState.copy(status = "画板保存失败：${e.message ?: "未知错误"}")
+                }
+            }
+        }
+    }
+
     fun setEchoSuppression(enabled: Boolean) {
         val wasRunning = uiState.running
         uiState = uiState.copy(echoSuppression = enabled)
@@ -1276,9 +1380,50 @@ private fun MsIcon(
     )
 }
 
+@Composable
+private fun Md2StaggeredFloatIn(
+    index: Int,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    var visible by remember(index, enabled) { mutableStateOf(!enabled) }
+
+    LaunchedEffect(index, enabled) {
+        if (!enabled) {
+            visible = true
+            return@LaunchedEffect
+        }
+        visible = false
+        delay((40L * index).coerceAtMost(260L))
+        visible = true
+    }
+
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(animationSpec = tween(220)) +
+                slideInVertically(
+                    initialOffsetY = { full -> (full * 0.12f).toInt() },
+                    animationSpec = tween(240, easing = FastOutSlowInEasing)
+                ),
+        exit = fadeOut(animationSpec = tween(90))
+    ) {
+        content()
+    }
+}
+
 private data class DrawerItem(
     val title: String,
     val icon: String
+)
+
+data class LogTopBarActions(
+    val onRefresh: () -> Unit,
+    val onCopy: () -> Unit,
+    val onShare: () -> Unit,
+    val canCopy: Boolean,
+    val canShare: Boolean
 )
 
 private object QuickSubtitleRoutes {
@@ -1287,6 +1432,8 @@ private object QuickSubtitleRoutes {
 }
 
 class MainActivity : ComponentActivity() {
+    private var lastDecorFitsSystemWindows: Boolean = false
+
     private val viewModel: MainViewModel by viewModels {
         val repo = ModelRepository(this@MainActivity)
         object : ViewModelProvider.Factory {
@@ -1332,6 +1479,26 @@ class MainActivity : ComponentActivity() {
     override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean) {
         super.onMultiWindowModeChanged(isInMultiWindowMode)
         applyWindowInsetPolicyForMode()
+        AppLogger.i(
+            "MainActivity.onMultiWindowModeChanged inMultiWindow=$isInMultiWindowMode " +
+                    "decorFits=$lastDecorFitsSystemWindows softInput=${softInputModeSummary(window.attributes.softInputMode)}"
+        )
+    }
+
+    override fun onResume() {
+        super.onResume()
+        AppLogger.i(
+            "MainActivity.onResume inMultiWindow=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInMultiWindowMode else false} " +
+                    "decorFits=$lastDecorFitsSystemWindows softInput=${softInputModeSummary(window.attributes.softInputMode)}"
+        )
+    }
+
+    override fun onPause() {
+        AppLogger.i(
+            "MainActivity.onPause inMultiWindow=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInMultiWindowMode else false} " +
+                    "decorFits=$lastDecorFitsSystemWindows softInput=${softInputModeSummary(window.attributes.softInputMode)}"
+        )
+        super.onPause()
     }
 
     private fun applyWindowInsetPolicyForMode() {
@@ -1343,6 +1510,11 @@ class MainActivity : ComponentActivity() {
         // Multi-window/floating mode: let the framework fit system windows to avoid title-bar overlap.
         // Fullscreen mode: keep edge-to-edge behavior.
         WindowCompat.setDecorFitsSystemWindows(window, inMultiWindow)
+        lastDecorFitsSystemWindows = inMultiWindow
+        AppLogger.i(
+            "applyWindowInsetPolicyForMode inMultiWindow=$inMultiWindow " +
+                    "decorFits=$lastDecorFitsSystemWindows softInput=${softInputModeSummary(window.attributes.softInputMode)}"
+        )
     }
 }
 
@@ -1495,20 +1667,23 @@ private fun Md2OutlinedField(
 fun AppScaffold(viewModel: MainViewModel) {
     val pageRealtime = 0
     val pageQuickSubtitle = 1
-    val pageTextToSpeech = 2
-    val pageVoicePack = 3
-    val pageDrawing = 4
-    val pageSettings = 5
-    val pageLog = 6
+    val pageVoicePack = 2
+    val pageDrawing = 3
+    val pageSettings = 4
+    val pageLog = 5
 
     var page by rememberSaveable { mutableStateOf(0) }
     var drawingFullscreen by rememberSaveable { mutableStateOf(false) }
+    var quickSubtitleFullscreen by rememberSaveable { mutableStateOf(false) }
     var runningStripCollapsed by rememberSaveable { mutableStateOf(false) }
+    var logTopBarActions by remember { mutableStateOf<LogTopBarActions?>(null) }
     val quickSubtitleNavController = rememberNavController()
     val quickSubtitleBackStackEntry by quickSubtitleNavController.currentBackStackEntryAsState()
     val quickSubtitleRoute = quickSubtitleBackStackEntry?.destination?.route ?: QuickSubtitleRoutes.Main
     val state = viewModel.uiState
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val localView = LocalView.current
     val activity = context as? Activity
     val inMultiWindowMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
         activity?.isInMultiWindowMode == true
@@ -1539,6 +1714,18 @@ fun AppScaffold(viewModel: MainViewModel) {
     }
     val configuration = androidx.compose.ui.platform.LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+    val layoutDirection = LocalLayoutDirection.current
+    val displayCutoutPadding = WindowInsets.displayCutout.asPaddingValues()
+    val landscapeCutoutStart = if (isLandscape && !inMultiWindowMode) {
+        displayCutoutPadding.calculateStartPadding(layoutDirection)
+    } else {
+        0.dp
+    }
+    val landscapeCutoutEnd = if (isLandscape && !inMultiWindowMode) {
+        displayCutoutPadding.calculateEndPadding(layoutDirection)
+    } else {
+        0.dp
+    }
     val hiddenDrawerWidth = remember(configuration.screenWidthDp) {
         val screenWidth = configuration.screenWidthDp.dp
         val targetWidth = UiTokens.DrawerWidthExpanded
@@ -1547,6 +1734,9 @@ fun AppScaffold(viewModel: MainViewModel) {
         val maxAllowed = (screenWidth - compatEdgeGap).coerceAtLeast(0.dp)
         if (maxAllowed <= 0.dp) screenWidth else minOf(targetWidth, maxAllowed)
     }
+    val permanentDrawerCollapsedWidth = UiTokens.DrawerWidthCollapsed + landscapeCutoutStart
+    val permanentDrawerExpandedWidth = UiTokens.DrawerWidthExpanded + landscapeCutoutStart
+    val hiddenDrawerSurfaceWidth = hiddenDrawerWidth + landscapeCutoutStart
     val usePermanentDrawer =
         isLandscape && state.landscapeDrawerMode == UserPrefs.DRAWER_MODE_PERMANENT
     val basePage = page
@@ -1559,7 +1749,6 @@ fun AppScaffold(viewModel: MainViewModel) {
     val drawerItems = listOf(
         DrawerItem("实时转换", "graphic_eq"),
         DrawerItem("便捷字幕", "subtitles"),
-        DrawerItem("文字转语音", "text_to_speech"),
         DrawerItem("语音包", "record_voice_over"),
         DrawerItem("画板", "draw"),
         DrawerItem("设置", "tune"),
@@ -1579,6 +1768,7 @@ fun AppScaffold(viewModel: MainViewModel) {
     }
     LaunchedEffect(page) {
         if (page != pageDrawing) drawingFullscreen = false
+        if (page != pageQuickSubtitle) quickSubtitleFullscreen = false
     }
     LaunchedEffect(drawingFullscreen, page) {
         if (drawingFullscreen && page == pageDrawing && !usePermanentDrawer) {
@@ -1592,6 +1782,70 @@ fun AppScaffold(viewModel: MainViewModel) {
     }
     LaunchedEffect(state.running) {
         if (!state.running) runningStripCollapsed = false
+    }
+    LaunchedEffect(basePage) {
+        if (basePage != pageLog) {
+            logTopBarActions = null
+        }
+    }
+    val baseSoftInputMode = remember(activity) {
+        activity?.window?.attributes?.softInputMode
+    }
+    fun applySoftInputModeForRoute() {
+        val window = activity?.window ?: return
+        val base = baseSoftInputMode ?: return
+        val stateMask = base and WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE
+        val adjustMask = if (quickSubtitleEditorOpen) {
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+        } else {
+            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+        }
+        window.setSoftInputMode(stateMask or adjustMask)
+        AppLogger.i(
+            "AppScaffold.applySoftInputModeForRoute page=$basePage route=$quickSubtitleRoute " +
+                    "editorOpen=$quickSubtitleEditorOpen softInput=${softInputModeSummary(window.attributes.softInputMode)}"
+        )
+    }
+
+    fun clearFocusAndHideIme(reason: String) {
+        activity?.currentFocus?.clearFocus()
+        localView.clearFocus()
+        val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.hideSoftInputFromWindow(localView.windowToken, 0)
+        AppLogger.i("AppScaffold.clearFocusAndHideIme reason=$reason")
+    }
+
+    SideEffect {
+        applySoftInputModeForRoute()
+    }
+    DisposableEffect(activity, lifecycleOwner, baseSoftInputMode) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START || event == Lifecycle.Event.ON_RESUME) {
+                applySoftInputModeForRoute()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            val window = activity?.window
+            val base = baseSoftInputMode
+            if (window != null && base != null) {
+                window.setSoftInputMode(base)
+            }
+        }
+    }
+    LaunchedEffect(basePage, quickSubtitleRoute) {
+        if (basePage != pageQuickSubtitle || quickSubtitleRoute != QuickSubtitleRoutes.Main) {
+            clearFocusAndHideIme("leave_quick_subtitle_main")
+        }
+    }
+    LaunchedEffect(basePage, quickSubtitleRoute, quickSubtitleEditorOpen, inMultiWindowMode) {
+        val mode = activity?.window?.attributes?.softInputMode ?: 0
+        AppLogger.i(
+            "AppScaffold.routeChanged page=$basePage route=$quickSubtitleRoute " +
+                    "editorOpen=$quickSubtitleEditorOpen inMultiWindow=$inMultiWindowMode " +
+                    "softInput=${softInputModeSummary(mode)}"
+        )
     }
 
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -1618,20 +1872,33 @@ fun AppScaffold(viewModel: MainViewModel) {
         Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .then(if (!inMultiWindowMode) Modifier.statusBarsPadding() else Modifier)
                 .padding(top = miuiFloatingTopCompensation)
                 .zIndex(2f),
             color = topBarColor,
             elevation = UiTokens.TopBarElevation
         ) {
             TopAppBar(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(if (!inMultiWindowMode) Modifier.statusBarsPadding() else Modifier)
+                    .padding(start = landscapeCutoutStart, end = landscapeCutoutEnd),
                 title = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Text(currentTitle)
+                        AnimatedContent(
+                            targetState = currentTitle,
+                            transitionSpec = {
+                                ContentTransform(
+                                    targetContentEnter = fadeIn(animationSpec = tween(140)),
+                                    initialContentExit = fadeOut(animationSpec = tween(110))
+                                )
+                            },
+                            label = "topbar_title_switch"
+                        ) { titleText ->
+                            Text(titleText)
+                        }
                         AnimatedVisibility(
                             visible = showRunningStrip,
                             enter = fadeIn(animationSpec = tween(140)) +
@@ -1656,20 +1923,87 @@ fun AppScaffold(viewModel: MainViewModel) {
                     }
                 },
                 navigationIcon = {
-                    if (quickSubtitleEditorOpen) {
-                        IconButton(onClick = { quickSubtitleNavController.popBackStack() }) {
-                            MsIcon("arrow_back", contentDescription = "返回")
-                        }
-                    } else {
-                        IconButton(onClick = onNavClick) {
-                            MsIcon("menu", contentDescription = "打开菜单")
+                    AnimatedContent(
+                        targetState = quickSubtitleEditorOpen,
+                        transitionSpec = {
+                            ContentTransform(
+                                targetContentEnter = fadeIn(animationSpec = tween(120)),
+                                initialContentExit = fadeOut(animationSpec = tween(90))
+                            )
+                        },
+                        label = "topbar_nav_switch"
+                    ) { editorOpen ->
+                        if (editorOpen) {
+                            IconButton(onClick = { quickSubtitleNavController.popBackStack() }) {
+                                MsIcon("arrow_back", contentDescription = "返回")
+                            }
+                        } else {
+                            IconButton(onClick = onNavClick) {
+                                MsIcon("menu", contentDescription = "打开菜单")
+                            }
                         }
                     }
                 },
                 actions = {
-                    if (basePage == pageVoicePack) {
-                        IconButton(onClick = { voicePicker.launch("*/*") }) {
-                            MsIcon("folder_open", contentDescription = "导入语音包")
+                    val actionState = basePage to quickSubtitleEditorOpen
+                    Crossfade(
+                        targetState = actionState,
+                        animationSpec = tween(durationMillis = 130),
+                        label = "topbar_actions_switch"
+                    ) { (pageForAction, editorOpen) ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(0.dp)
+                        ) {
+                            when (pageForAction) {
+                                pageQuickSubtitle -> {
+                                    if (!editorOpen) {
+                                        IconButton(
+                                            onClick = { quickSubtitleFullscreen = !quickSubtitleFullscreen }
+                                        ) {
+                                            MsIcon(
+                                                name = if (quickSubtitleFullscreen) "fullscreen_exit" else "fullscreen",
+                                                contentDescription = if (quickSubtitleFullscreen) "退出全屏" else "进入全屏"
+                                            )
+                                        }
+                                    }
+                                }
+                                pageDrawing -> {
+                                    val canSaveDrawing = viewModel.drawStrokes.isNotEmpty()
+                                    IconButton(
+                                        onClick = { viewModel.saveDrawingSnapshot() },
+                                        enabled = canSaveDrawing
+                                    ) {
+                                        MsIcon("save", contentDescription = "保存画板")
+                                    }
+                                }
+                                pageVoicePack -> {
+                                    IconButton(onClick = { voicePicker.launch("*/*") }) {
+                                        MsIcon("folder_open", contentDescription = "导入语音包")
+                                    }
+                                }
+                                pageLog -> {
+                                    val actions = logTopBarActions
+                                    if (actions != null) {
+                                        IconButton(onClick = actions.onRefresh) {
+                                            MsIcon("refresh", contentDescription = "刷新日志")
+                                        }
+                                        IconButton(
+                                            onClick = actions.onCopy,
+                                            enabled = actions.canCopy
+                                        ) {
+                                            MsIcon("content_copy", contentDescription = "复制日志")
+                                        }
+                                        IconButton(
+                                            onClick = actions.onShare,
+                                            enabled = actions.canShare
+                                        ) {
+                                            MsIcon("share", contentDescription = "分享日志")
+                                        }
+                                    }
+                                }
+                                else -> Unit
+                            }
                         }
                     }
                 },
@@ -1727,9 +2061,9 @@ fun AppScaffold(viewModel: MainViewModel) {
                         navController = quickSubtitleNavController,
                         viewModel = viewModel,
                         state = state,
-                        onToggleMic = onToggleRun
+                        onToggleMic = onToggleRun,
+                        fullscreenMode = quickSubtitleFullscreen && !quickSubtitleEditorOpen
                     )
-                    pageTextToSpeech -> TextToSpeechScreen(viewModel, state)
                     pageVoicePack -> VoicePackScreen(viewModel, state)
                     pageDrawing -> DrawingBoardScreen(
                         viewModel = viewModel,
@@ -1737,7 +2071,9 @@ fun AppScaffold(viewModel: MainViewModel) {
                         onToggleFullscreen = { drawingFullscreen = !drawingFullscreen }
                     )
                     pageSettings -> SettingsScreen(viewModel, state)
-                    pageLog -> LogScreen()
+                    pageLog -> LogScreen(
+                        onTopBarActionsChange = { logTopBarActions = it }
+                    )
                 }
             }
             AnimatedVisibility(
@@ -1765,15 +2101,15 @@ fun AppScaffold(viewModel: MainViewModel) {
                     .align(Alignment.TopStart)
                     .fillMaxWidth()
                     .zIndex(2f),
-                enter = fadeIn(animationSpec = tween(160)) +
+                enter = fadeIn(animationSpec = tween(120)) +
                         slideInVertically(
-                            initialOffsetY = { full -> -full / 3 },
-                            animationSpec = tween(160, easing = FastOutSlowInEasing)
+                            initialOffsetY = { full -> -full },
+                            animationSpec = tween(220, easing = FastOutSlowInEasing)
                         ),
-                exit = fadeOut(animationSpec = tween(120)) +
+                exit = fadeOut(animationSpec = tween(90)) +
                         slideOutVertically(
-                            targetOffsetY = { full -> -full / 3 },
-                            animationSpec = tween(120, easing = FastOutSlowInEasing)
+                            targetOffsetY = { full -> -full },
+                            animationSpec = tween(170, easing = FastOutSlowInEasing)
                         )
             ) {
                 RunningStatusTopStrip(
@@ -1787,143 +2123,97 @@ fun AppScaffold(viewModel: MainViewModel) {
     }
 
     val drawingImmersive = drawingFullscreen && basePage == pageDrawing
+    val quickSubtitleImmersive =
+        quickSubtitleFullscreen && basePage == pageQuickSubtitle && !quickSubtitleEditorOpen
+    val fullScreenImmersive = drawingImmersive || quickSubtitleImmersive
+    BackHandler(enabled = drawingImmersive) {
+        drawingFullscreen = false
+    }
+    BackHandler(enabled = quickSubtitleImmersive) {
+        quickSubtitleFullscreen = false
+    }
     Box(modifier = Modifier.fillMaxSize()) {
-        AnimatedContent(
-            targetState = drawingImmersive,
-            transitionSpec = {
-                ContentTransform(
-                    targetContentEnter = fadeIn(animationSpec = tween(220, delayMillis = 40)) +
-                            slideInVertically(
-                                initialOffsetY = { full -> full / 16 },
-                                animationSpec = tween(220, easing = FastOutSlowInEasing)
-                            ),
-                    initialContentExit = fadeOut(animationSpec = tween(160)) +
-                            slideOutVertically(
-                                targetOffsetY = { full -> -full / 20 },
-                                animationSpec = tween(160, easing = FastOutSlowInEasing)
-                            )
-                )
-            },
-            label = "drawing_fullscreen_switch"
+        Crossfade(
+            targetState = fullScreenImmersive,
+            animationSpec = tween(durationMillis = 150),
+            label = "fullscreen_switch"
         ) { immersive ->
             if (immersive) {
-                Scaffold(
-                    backgroundColor = MaterialTheme.colorScheme.background
-                ) { innerPadding ->
-                    contentArea(
-                        Modifier
-                            .fillMaxSize()
-                            .padding(innerPadding)
-                    )
-                }
+            Scaffold(
+                backgroundColor = MaterialTheme.colorScheme.background
+            ) { innerPadding ->
+                contentArea(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .padding(start = landscapeCutoutStart, end = landscapeCutoutEnd)
+                )
+            }
             } else if (usePermanentDrawer) {
-                Scaffold(
-                    topBar = { topBar { drawerExpanded = !drawerExpanded } },
-                    floatingActionButton = fab,
-                    backgroundColor = MaterialTheme.colorScheme.background
-                ) { innerPadding ->
-                    Box(
+            Scaffold(
+                topBar = { topBar { drawerExpanded = !drawerExpanded } },
+                floatingActionButton = fab,
+                backgroundColor = MaterialTheme.colorScheme.background
+            ) { innerPadding ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                ) {
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        Surface(
+                            modifier = Modifier
+                                .width(permanentDrawerCollapsedWidth)
+                                .fillMaxHeight()
+                                .zIndex(3f),
+                            shape = RectangleShape,
+                            color = MaterialTheme.colorScheme.surface,
+                            elevation = UiTokens.MenuElevation
+                        ) {
+                            AppDrawerContent(
+                                items = drawerItems,
+                                page = drawerSelectedPage,
+                                expanded = false,
+                                applyStatusBarPadding = false,
+                                showHeader = false,
+                                showTopDivider = false,
+                                topInset = 8.dp,
+                                horizontalStartInset = landscapeCutoutStart,
+                                onSelect = { page = it }
+                            )
+                        }
+                        contentArea(
+                            Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .graphicsLayer { clip = true }
+                                .zIndex(0f)
+                                .padding(end = landscapeCutoutEnd)
+                        )
+                    }
+
+                    AnimatedVisibility(
+                        visible = drawerExpanded,
                         modifier = Modifier
-                            .fillMaxSize()
-                            .padding(innerPadding)
+                            .matchParentSize()
+                            .zIndex(3f),
+                        enter = fadeIn(animationSpec = tween(120)) +
+                                androidx.compose.animation.slideInHorizontally(
+                                    initialOffsetX = { -it / 6 },
+                                    animationSpec = tween(120, easing = FastOutSlowInEasing)
+                                ),
+                        exit = fadeOut(animationSpec = tween(90)) +
+                                androidx.compose.animation.slideOutHorizontally(
+                                    targetOffsetX = { -it / 6 },
+                                    animationSpec = tween(90, easing = FastOutSlowInEasing)
+                                )
                     ) {
                         Row(modifier = Modifier.fillMaxSize()) {
                             Surface(
                                 modifier = Modifier
-                                    .width(UiTokens.DrawerWidthCollapsed)
-                                    .fillMaxHeight(),
-                                shape = RectangleShape,
-                                color = MaterialTheme.colorScheme.surface,
-                                elevation = UiTokens.MenuElevation
-                            ) {
-                                AppDrawerContent(
-                                    items = drawerItems,
-                                    page = drawerSelectedPage,
-                                    expanded = false,
-                                    applyStatusBarPadding = false,
-                                    showHeader = false,
-                                    showTopDivider = false,
-                                    topInset = 8.dp,
-                                    onSelect = { page = it }
-                                )
-                            }
-                            contentArea(
-                                Modifier
-                                    .weight(1f)
+                                    .width(permanentDrawerExpandedWidth)
                                     .fillMaxHeight()
-                            )
-                        }
-
-                        AnimatedVisibility(
-                            visible = drawerExpanded,
-                            modifier = Modifier
-                                .matchParentSize()
-                                .zIndex(3f),
-                            enter = fadeIn(animationSpec = tween(120)) +
-                                    androidx.compose.animation.slideInHorizontally(
-                                        initialOffsetX = { -it / 6 },
-                                        animationSpec = tween(120, easing = FastOutSlowInEasing)
-                                    ),
-                            exit = fadeOut(animationSpec = tween(90)) +
-                                    androidx.compose.animation.slideOutHorizontally(
-                                        targetOffsetX = { -it / 6 },
-                                        animationSpec = tween(90, easing = FastOutSlowInEasing)
-                                    )
-                        ) {
-                            Row(modifier = Modifier.fillMaxSize()) {
-                                Surface(
-                                    modifier = Modifier
-                                        .width(UiTokens.DrawerWidthExpanded)
-                                        .fillMaxHeight(),
-                                    shape = RectangleShape,
-                                    color = MaterialTheme.colorScheme.surface,
-                                    elevation = UiTokens.MenuElevation
-                                ) {
-                                    AppDrawerContent(
-                                        items = drawerItems,
-                                        page = drawerSelectedPage,
-                                        expanded = true,
-                                        applyStatusBarPadding = false,
-                                        showHeader = false,
-                                        showTopDivider = false,
-                                        topInset = 8.dp,
-                                        onSelect = {
-                                            page = it
-                                            drawerExpanded = false
-                                        }
-                                    )
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .fillMaxHeight()
-                                        .clickable(
-                                            interactionSource = remember { MutableInteractionSource() },
-                                            indication = null
-                                        ) {
-                                            drawerExpanded = false
-                                            runningStripCollapsed = true
-                                        }
-                                )
-                            }
-                        }
-                    }
-                }
-            } else {
-                ModalDrawer(
-                    drawerState = drawerState,
-                    drawerShape = RectangleShape,
-                    drawerBackgroundColor = Color.Transparent,
-                    drawerElevation = 0.dp,
-                    scrimColor = hiddenDrawerScrimColor,
-                    drawerContent = {
-                        Row(
-                            modifier = Modifier.fillMaxHeight()
-                        ) {
-                            Surface(
-                                modifier = Modifier
-                                    .width(hiddenDrawerWidth)
-                                    .fillMaxHeight(),
+                                    .zIndex(4f),
                                 shape = RectangleShape,
                                 color = MaterialTheme.colorScheme.surface,
                                 elevation = UiTokens.MenuElevation
@@ -1932,13 +2222,14 @@ fun AppScaffold(viewModel: MainViewModel) {
                                     items = drawerItems,
                                     page = drawerSelectedPage,
                                     expanded = true,
-                                    applyStatusBarPadding = !inMultiWindowMode,
-                                    showHeader = true,
-                                    showTopDivider = true,
-                                    topInset = 12.dp,
+                                    applyStatusBarPadding = false,
+                                    showHeader = false,
+                                    showTopDivider = false,
+                                    topInset = 8.dp,
+                                    horizontalStartInset = landscapeCutoutStart,
                                     onSelect = {
                                         page = it
-                                        scope.launch { drawerState.close() }
+                                        drawerExpanded = false
                                     }
                                 )
                             }
@@ -1950,25 +2241,76 @@ fun AppScaffold(viewModel: MainViewModel) {
                                         interactionSource = remember { MutableInteractionSource() },
                                         indication = null
                                     ) {
-                                        scope.launch { drawerState.close() }
+                                        drawerExpanded = false
+                                        runningStripCollapsed = true
                                     }
                             )
                         }
                     }
-                ) {
-                    Scaffold(
-                        topBar = { topBar { scope.launch { drawerState.open() } } },
-                        floatingActionButton = fab,
-                        backgroundColor = MaterialTheme.colorScheme.background
+                }
+            }
+            } else {
+            ModalDrawer(
+                drawerState = drawerState,
+                drawerShape = RectangleShape,
+                drawerBackgroundColor = Color.Transparent,
+                drawerElevation = 0.dp,
+                scrimColor = hiddenDrawerScrimColor,
+                drawerContent = {
+                    Row(
+                        modifier = Modifier.fillMaxHeight()
+                    ) {
+                        Surface(
+                            modifier = Modifier
+                                .width(hiddenDrawerSurfaceWidth)
+                                .fillMaxHeight(),
+                            shape = RectangleShape,
+                            color = MaterialTheme.colorScheme.surface,
+                            elevation = UiTokens.MenuElevation
+                        ) {
+                            AppDrawerContent(
+                                items = drawerItems,
+                                page = drawerSelectedPage,
+                                expanded = true,
+                                applyStatusBarPadding = !inMultiWindowMode,
+                                showHeader = true,
+                                showTopDivider = true,
+                                topInset = 12.dp,
+                                horizontalStartInset = landscapeCutoutStart,
+                                onSelect = {
+                                    page = it
+                                    scope.launch { drawerState.close() }
+                                }
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null
+                                ) {
+                                    scope.launch { drawerState.close() }
+                                }
+                        )
+                    }
+                }
+            ) {
+                Scaffold(
+                    topBar = { topBar { scope.launch { drawerState.open() } } },
+                    floatingActionButton = fab,
+                    backgroundColor = MaterialTheme.colorScheme.background
                     ) { innerPadding ->
                         contentArea(
                             Modifier
                                 .fillMaxSize()
                                 .padding(innerPadding)
+                                .padding(start = landscapeCutoutStart, end = landscapeCutoutEnd)
                         )
                     }
                 }
-            }
+        }
         }
     }
 }
@@ -1982,6 +2324,7 @@ private fun AppDrawerContent(
     showHeader: Boolean,
     showTopDivider: Boolean,
     topInset: Dp,
+    horizontalStartInset: Dp = 0.dp,
     onSelect: (Int) -> Unit
 ) {
     val animatedItemStartPadding by animateDpAsState(
@@ -2019,6 +2362,7 @@ private fun AppDrawerContent(
         modifier = Modifier
             .then(if (applyStatusBarPadding) Modifier.statusBarsPadding() else Modifier)
             .fillMaxSize()
+            .padding(start = horizontalStartInset)
             .verticalScroll(rememberScrollState())
     ) {
         Spacer(Modifier.height(topInset))
@@ -2221,24 +2565,29 @@ fun VoicePackScreen(viewModel: MainViewModel, state: UiState) {
                 Text("暂无语音包，请点击主标题栏导入按钮。")
             }
         } else {
-            VoicePackRecyclerList(
+            Md2StaggeredFloatIn(
+                index = 0,
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
-                packs = state.voicePacks,
-                currentVoicePath = state.voiceDir?.absolutePath,
-                onSelect = { viewModel.selectVoice(it.dir) },
-                onTogglePin = { viewModel.toggleVoicePin(it) },
-                onDetail = { pack ->
-                    detailPackPath = pack.dir.absolutePath
-                    detailName = pack.meta.name
-                    detailRemark = pack.meta.remark
-                    detailEditing = false
-                },
-                onShare = { viewModel.shareVoice(it) },
-                onDelete = { deletePack = it },
-                onReorder = { newOrder -> viewModel.reorderVoicePacks(newOrder) }
-            )
+                    .fillMaxWidth()
+            ) {
+                VoicePackRecyclerList(
+                    modifier = Modifier.fillMaxSize(),
+                    packs = state.voicePacks,
+                    currentVoicePath = state.voiceDir?.absolutePath,
+                    onSelect = { viewModel.selectVoice(it.dir) },
+                    onTogglePin = { viewModel.toggleVoicePin(it) },
+                    onDetail = { pack ->
+                        detailPackPath = pack.dir.absolutePath
+                        detailName = pack.meta.name
+                        detailRemark = pack.meta.remark
+                        detailEditing = false
+                    },
+                    onShare = { viewModel.shareVoice(it) },
+                    onDelete = { deletePack = it },
+                    onReorder = { newOrder -> viewModel.reorderVoicePacks(newOrder) }
+                )
+            }
         }
         Spacer(Modifier.height(UiTokens.PageBottomBlank))
     }
@@ -2504,6 +2853,9 @@ private class VoicePackRecyclerAdapter(
 ) : RecyclerView.Adapter<VoicePackRecyclerAdapter.VoicePackViewHolder>() {
 
     private val items = mutableListOf<VoicePackInfo>()
+    private val stagedAppearedIds = hashSetOf<Long>()
+    private var runStaggerOnNextBind = true
+    private var staggerReleaseScheduled = false
     var isDragging: Boolean = false
     var onStartDrag: ((RecyclerView.ViewHolder) -> Unit)? = null
 
@@ -2538,6 +2890,23 @@ private class VoicePackRecyclerAdapter(
         if (!isDragging) {
             holder.itemView.translationZ = 0f
         }
+        val itemId = getItemId(position)
+        val shouldStagger = runStaggerOnNextBind && !stagedAppearedIds.contains(itemId)
+        if (shouldStagger) {
+            stagedAppearedIds.add(itemId)
+            animateVoicePackStaggerEnter(holder.itemView, position)
+            if (!staggerReleaseScheduled) {
+                staggerReleaseScheduled = true
+                holder.itemView.postDelayed(
+                    { runStaggerOnNextBind = false },
+                    560L
+                )
+            }
+        } else {
+            holder.itemView.animate().cancel()
+            holder.itemView.alpha = 1f
+            holder.itemView.translationY = 0f
+        }
         holder.setDragged(false)
         val pack = items[position]
         holder.bind(
@@ -2561,12 +2930,20 @@ private class VoicePackRecyclerAdapter(
     override fun onViewRecycled(holder: VoicePackViewHolder) {
         holder.setDragged(false)
         holder.itemView.translationZ = 0f
+        holder.itemView.alpha = 1f
+        holder.itemView.translationY = 0f
         super.onViewRecycled(holder)
     }
 
     fun submitFromState(newItems: List<VoicePackInfo>) {
         if (isDragging) return
         if (items == newItems) return
+        val shouldRunStagger = items.isEmpty() && newItems.isNotEmpty()
+        if (shouldRunStagger) {
+            runStaggerOnNextBind = true
+            staggerReleaseScheduled = false
+            stagedAppearedIds.clear()
+        }
         items.clear()
         items.addAll(newItems)
         notifyDataSetChanged()
@@ -2767,12 +3144,29 @@ private fun animateDragElevation(view: View, elevated: Boolean) {
         .start()
 }
 
+private fun animateVoicePackStaggerEnter(view: View, position: Int) {
+    val density = view.resources.displayMetrics.density
+    val offsetY = 12f * density
+    val delayMs = (position.coerceIn(0, 10) * 36L)
+    view.animate().cancel()
+    view.alpha = 0f
+    view.translationY = offsetY
+    view.animate()
+        .alpha(1f)
+        .translationY(0f)
+        .setStartDelay(delayMs)
+        .setDuration(220L)
+        .setInterpolator(FastOutSlowInInterpolator())
+        .start()
+}
+
 @Composable
 private fun QuickSubtitleNavHost(
     navController: NavHostController,
     viewModel: MainViewModel,
     state: UiState,
-    onToggleMic: () -> Unit
+    onToggleMic: () -> Unit,
+    fullscreenMode: Boolean
 ) {
     NavHost(
         navController = navController,
@@ -2836,7 +3230,8 @@ private fun QuickSubtitleNavHost(
                 viewModel = viewModel,
                 state = state,
                 onToggleMic = onToggleMic,
-                onOpenEditor = { navController.navigate(QuickSubtitleRoutes.Editor) }
+                onOpenEditor = { navController.navigate(QuickSubtitleRoutes.Editor) },
+                fullscreenMode = fullscreenMode
             )
         }
         composable(QuickSubtitleRoutes.Editor) {
@@ -2853,9 +3248,10 @@ fun QuickSubtitleScreen(
     viewModel: MainViewModel,
     state: UiState,
     onToggleMic: () -> Unit,
-    onOpenEditor: () -> Unit
+    onOpenEditor: () -> Unit,
+    fullscreenMode: Boolean
 ) {
-    val hostActivity = LocalContext.current as? Activity
+    val focusManager = LocalFocusManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val groups = viewModel.quickSubtitleGroups
     val selectedGroupIndex = viewModel.currentQuickSubtitleGroupIndex().coerceIn(0, groups.lastIndex.coerceAtLeast(0))
@@ -2882,33 +3278,19 @@ fun QuickSubtitleScreen(
         }
     }
     val hasVoice = state.voiceDir != null
-
-    // Keep content fixed while keyboard opens; only bottom composer/FAB follow IME.
-    DisposableEffect(hostActivity, lifecycleOwner) {
-        val window = hostActivity?.window
-        val previousMode = window?.attributes?.softInputMode
-        fun applyAdjustNothing() {
-            if (window != null && previousMode != null) {
-                val newMode =
-                    (previousMode and WindowManager.LayoutParams.SOFT_INPUT_MASK_STATE) or
-                            WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
-                window.setSoftInputMode(newMode)
-            }
-        }
-        if (window != null && previousMode != null) {
-            applyAdjustNothing()
-        }
+    val statusBarInsetTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val quickSubtitleTopBlank =
+        if (fullscreenMode) (statusBarInsetTop + UiTokens.PageTopBlank) else UiTokens.PageTopBlank
+    DisposableEffect(lifecycleOwner, focusManager) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                applyAdjustNothing()
+            if (event == Lifecycle.Event.ON_PAUSE) {
+                focusManager.clearFocus(force = true)
+                AppLogger.i("QuickSubtitleScreen.onPause clearFocus")
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            if (window != null && previousMode != null) {
-                window.setSoftInputMode(previousMode)
-            }
         }
     }
 
@@ -2917,157 +3299,186 @@ fun QuickSubtitleScreen(
             modifier = Modifier
                 .fillMaxSize()
         ) {
-            Spacer(Modifier.height(UiTokens.PageTopBlank))
-            Card(
+            Spacer(Modifier.height(quickSubtitleTopBlank))
+            Md2StaggeredFloatIn(
+                index = 0,
+                enabled = false,
                 modifier = Modifier
                     .padding(horizontal = 16.dp)
                     .fillMaxWidth()
                     .weight(1f)
-                    .heightIn(min = 260.dp),
-                shape = RoundedCornerShape(UiTokens.Radius),
-                backgroundColor = md2CardContainerColor(),
-                elevation = UiTokens.CardElevation
+                    .heightIn(min = 260.dp)
             ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(12.dp)
+                Card(
+                    modifier = Modifier.fillMaxSize(),
+                    shape = RoundedCornerShape(UiTokens.Radius),
+                    backgroundColor = md2CardContainerColor(),
+                    elevation = UiTokens.CardElevation
                 ) {
-                    Box(
+                    Column(
                         modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
-                    ) {
-                        Text(
-                            text = subtitleText,
-                            style = MaterialTheme.typography.bodyLarge.copy(
-                                fontWeight = FontWeight.Bold,
-                                fontSize = subtitleSize.sp,
-                                lineHeight = (subtitleSize * 1.15f).sp
-                            )
-                        )
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        MsIcon("search", contentDescription = "字体大小")
-                        Slider(
-                            value = subtitleSize,
-                            onValueChange = { viewModel.setQuickSubtitleFontSize(it) },
-                            valueRange = 28f..96f,
-                            modifier = Modifier.weight(1f)
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(100.dp)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Keep frame edges flush; reserve shadow space inside scroll content.
-                Spacer(Modifier.width(8.dp))
-                quickItems.forEach { text ->
-                    Card(
-                        modifier = Modifier
-                            .padding(vertical = 3.dp)
-                            .width(148.dp)
-                            .height(94.dp)
-                            .clickable {
-                                viewModel.applyQuickSubtitleText(
-                                    text = text,
-                                    enqueueSpeak = hasVoice
-                                )
-                            },
-                        shape = RoundedCornerShape(UiTokens.Radius),
-                        backgroundColor = md2CardContainerColor(),
-                        elevation = UiTokens.CardElevation
+                            .fillMaxSize()
+                            .padding(12.dp)
                     ) {
                         Box(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            contentAlignment = Alignment.CenterStart
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState())
                         ) {
-                            Text(
-                                text = text,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodyLarge
+                            AnimatedContent(
+                                targetState = subtitleText,
+                                transitionSpec = {
+                                    ContentTransform(
+                                        targetContentEnter = fadeIn(animationSpec = tween(180)) +
+                                                slideInVertically(
+                                                    initialOffsetY = { full -> full / 6 },
+                                                    animationSpec = tween(200, easing = FastOutSlowInEasing)
+                                                ),
+                                        initialContentExit = fadeOut(animationSpec = tween(120))
+                                    )
+                                },
+                                label = "quick_subtitle_text_change"
+                            ) { text ->
+                                Text(
+                                    text = text,
+                                    style = MaterialTheme.typography.bodyLarge.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = subtitleSize.sp,
+                                        lineHeight = (subtitleSize * 1.15f).sp
+                                    )
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            MsIcon("search", contentDescription = "字体大小")
+                            Slider(
+                                value = subtitleSize,
+                                onValueChange = { viewModel.setQuickSubtitleFontSize(it) },
+                                valueRange = 28f..96f,
+                                modifier = Modifier.weight(1f)
                             )
                         }
                     }
                 }
-                Spacer(Modifier.width(8.dp))
             }
 
             Spacer(Modifier.height(8.dp))
-            Card(
-                modifier = Modifier
-                    .padding(horizontal = 16.dp)
-                    .fillMaxWidth(),
-                shape = RoundedCornerShape(UiTokens.Radius),
-                backgroundColor = md2CardContainerColor(),
-                elevation = UiTokens.CardElevation
-            ) {
+            Md2StaggeredFloatIn(index = 1, enabled = false) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(48.dp),
+                        .height(100.dp)
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                            .horizontalScroll(rememberScrollState()),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        groups.forEachIndexed { index, group ->
-                            val selected = selectedGroupIndex == index
-                            val tabBg = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
-                            Row(
+                    // Keep frame edges flush; reserve shadow space inside scroll content.
+                    Spacer(Modifier.width(8.dp))
+                    quickItems.forEach { text ->
+                        Card(
+                            modifier = Modifier
+                                .padding(vertical = 3.dp)
+                                .width(148.dp)
+                                .height(94.dp)
+                                .clickable {
+                                    viewModel.applyQuickSubtitleText(
+                                        text = text,
+                                        enqueueSpeak = hasVoice
+                                    )
+                                },
+                            shape = RoundedCornerShape(UiTokens.Radius),
+                            backgroundColor = md2CardContainerColor(),
+                            elevation = UiTokens.CardElevation
+                        ) {
+                            Box(
                                 modifier = Modifier
-                                    .height(48.dp)
-                                    .clip(RoundedCornerShape(UiTokens.Radius))
-                                    .background(tabBg)
-                                    .clickable { viewModel.selectQuickSubtitleGroup(index) }
-                                    .padding(horizontal = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    .fillMaxSize()
+                                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                                contentAlignment = Alignment.CenterStart
                             ) {
-                                MsIcon(group.icon, contentDescription = group.title)
-                                Text(group.title, maxLines = 1)
-                            }
-                            if (index != groups.lastIndex) {
-                                Spacer(Modifier.width(2.dp))
+                                Text(
+                                    text = text,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
                             }
                         }
                     }
-                    Surface(
+                    Spacer(Modifier.width(8.dp))
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Md2StaggeredFloatIn(
+                index = 2,
+                enabled = false,
+                modifier = Modifier
+                    .padding(horizontal = 16.dp)
+                    .fillMaxWidth()
+            ) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(UiTokens.Radius),
+                    backgroundColor = md2CardContainerColor(),
+                    elevation = UiTokens.CardElevation
+                ) {
+                    Row(
                         modifier = Modifier
-                            .fillMaxHeight()
-                            .width(52.dp),
-                        color = MaterialTheme.colorScheme.primary
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
-                            IconButton(onClick = onOpenEditor) {
-                                MsIcon(
-                                    "edit",
-                                    contentDescription = "编辑快捷文本",
-                                    tint = MaterialTheme.colorScheme.onPrimary
-                                )
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            groups.forEachIndexed { index, group ->
+                                val selected = selectedGroupIndex == index
+                                val tabBg = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
+                                Row(
+                                    modifier = Modifier
+                                        .height(48.dp)
+                                        .clip(RoundedCornerShape(UiTokens.Radius))
+                                        .background(tabBg)
+                                        .clickable { viewModel.selectQuickSubtitleGroup(index) }
+                                        .padding(horizontal = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    MsIcon(group.icon, contentDescription = group.title)
+                                    Text(group.title, maxLines = 1)
+                                }
+                                if (index != groups.lastIndex) {
+                                    Spacer(Modifier.width(2.dp))
+                                }
+                            }
+                        }
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxHeight()
+                                .width(52.dp),
+                            color = MaterialTheme.colorScheme.primary
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                IconButton(onClick = onOpenEditor) {
+                                    MsIcon(
+                                        "edit",
+                                        contentDescription = "编辑快捷文本",
+                                        tint = MaterialTheme.colorScheme.onPrimary
+                                    )
+                                }
                             }
                         }
                     }
@@ -3225,6 +3636,19 @@ fun QuickSubtitleScreen(
 }
 
 @Composable
+private fun Md2CardTitleText(
+    text: String,
+    modifier: Modifier = Modifier
+) {
+    Text(
+        text = text,
+        modifier = modifier,
+        fontWeight = FontWeight.Bold
+    )
+}
+
+@Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun QuickSubtitleEditorScreen(
     viewModel: MainViewModel,
     modifier: Modifier = Modifier
@@ -3250,10 +3674,13 @@ private fun QuickSubtitleEditorScreen(
             "emoji_people"
         )
     }
+    val groupNameBringIntoViewRequester = remember { BringIntoViewRequester() }
+    val bringIntoViewScope = rememberCoroutineScope()
 
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
+            .imePadding()
             .padding(horizontal = 16.dp),
         contentPadding = PaddingValues(
             top = UiTokens.PageTopBlank,
@@ -3278,7 +3705,7 @@ private fun QuickSubtitleEditorScreen(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("分组", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        Md2CardTitleText("分组", modifier = Modifier.weight(1f))
                         Md2TextButton(onClick = { viewModel.addQuickSubtitleGroup() }) {
                             MsIcon("add", contentDescription = "新增分组")
                             Spacer(Modifier.width(4.dp))
@@ -3325,7 +3752,16 @@ private fun QuickSubtitleEditorScreen(
                                 )
                             },
                             label = "分组名称",
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .bringIntoViewRequester(groupNameBringIntoViewRequester)
+                                .onFocusChanged { focusState ->
+                                    if (focusState.isFocused) {
+                                        bringIntoViewScope.launch {
+                                            groupNameBringIntoViewRequester.bringIntoView()
+                                        }
+                                    }
+                                }
                         )
                         Row(
                             modifier = Modifier
@@ -3420,6 +3856,9 @@ private fun QuickSubtitleItemsRecyclerCard(
     onItemsChanged: (List<String>) -> Unit,
     onItemTextChanged: (Int, String) -> Unit
 ) {
+    var editTargetIndex by remember(items) { mutableStateOf<Int?>(null) }
+    var editText by remember { mutableStateOf("") }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(UiTokens.Radius),
@@ -3433,7 +3872,7 @@ private fun QuickSubtitleItemsRecyclerCard(
                     .padding(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("快捷文本", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Md2CardTitleText("快捷文本", modifier = Modifier.weight(1f))
                 Md2TextButton(onClick = onAdd) {
                     MsIcon("add", contentDescription = "新增文本")
                     Spacer(Modifier.width(4.dp))
@@ -3447,9 +3886,52 @@ private fun QuickSubtitleItemsRecyclerCard(
                     .padding(horizontal = 8.dp, vertical = 6.dp),
                 items = items,
                 onItemsChanged = onItemsChanged,
-                onItemTextChanged = onItemTextChanged
+                onEditRequested = { index, value ->
+                    editTargetIndex = index
+                    editText = value
+                }
             )
         }
+    }
+
+    val editingIndex = editTargetIndex
+    if (editingIndex != null && editingIndex in items.indices) {
+        AlertDialog(
+            onDismissRequest = { editTargetIndex = null },
+            title = { Text("编辑快捷文本") },
+            text = {
+                OutlinedTextField(
+                    value = editText,
+                    onValueChange = { editText = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    maxLines = 4,
+                    shape = RoundedCornerShape(UiTokens.Radius),
+                    colors = TextFieldDefaults.outlinedTextFieldColors(
+                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                        focusedLabelColor = MaterialTheme.colorScheme.primary,
+                        unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        cursorColor = MaterialTheme.colorScheme.primary
+                    )
+                )
+            },
+            confirmButton = {
+                Md2TextButton(onClick = {
+                    val idx = editTargetIndex
+                    if (idx != null && idx in items.indices) {
+                        onItemTextChanged(idx, editText)
+                    }
+                    editTargetIndex = null
+                }) {
+                    Text("保存")
+                }
+            },
+            dismissButton = {
+                Md2TextButton(onClick = { editTargetIndex = null }) {
+                    Text("取消")
+                }
+            }
+        )
     }
 }
 
@@ -3458,11 +3940,11 @@ private fun QuickSubtitleItemsRecyclerList(
     modifier: Modifier = Modifier,
     items: List<String>,
     onItemsChanged: (List<String>) -> Unit,
-    onItemTextChanged: (Int, String) -> Unit
+    onEditRequested: (Int, String) -> Unit
 ) {
     val parentComposition = rememberCompositionContext()
     val onItemsChangedState = rememberUpdatedState(onItemsChanged)
-    val onItemTextChangedState = rememberUpdatedState(onItemTextChanged)
+    val onEditRequestedState = rememberUpdatedState(onEditRequested)
 
     AndroidView(
         modifier = modifier,
@@ -3485,7 +3967,7 @@ private fun QuickSubtitleItemsRecyclerList(
             val adapter = QuickSubtitleItemRecyclerAdapter(
                 parentComposition = parentComposition,
                 onItemsChanged = { changed -> onItemsChangedState.value(changed) },
-                onItemTextChanged = { index, value -> onItemTextChangedState.value(index, value) }
+                onEditRequested = { index, value -> onEditRequestedState.value(index, value) }
             )
             recycler.adapter = adapter
 
@@ -3562,7 +4044,7 @@ private data class QuickSubtitleEditableItem(
 private class QuickSubtitleItemRecyclerAdapter(
     private val parentComposition: CompositionContext,
     private val onItemsChanged: (List<String>) -> Unit,
-    private val onItemTextChanged: (Int, String) -> Unit
+    private val onEditRequested: (Int, String) -> Unit
 ) : RecyclerView.Adapter<QuickSubtitleItemRecyclerAdapter.ItemViewHolder>() {
 
     private val items = mutableListOf<QuickSubtitleEditableItem>()
@@ -3601,19 +4083,18 @@ private class QuickSubtitleItemRecyclerAdapter(
             text = row.text,
             isDragged = draggingItemId == row.id,
             canDelete = items.size > 1,
-            onUpdate = { value ->
-                val idx = holder.bindingAdapterPosition
-                if (idx in items.indices) {
-                    items[idx].text = value
-                    onItemTextChanged(idx, value)
-                }
-            },
             onDelete = {
                 val idx = holder.bindingAdapterPosition
                 if (idx in items.indices && items.size > 1) {
                     items.removeAt(idx)
                     notifyItemRemoved(idx)
                     onItemsChanged(snapshotTexts())
+                }
+            },
+            onEdit = {
+                val idx = holder.bindingAdapterPosition
+                if (idx in items.indices) {
+                    onEditRequested(idx, items[idx].text)
                 }
             },
             onStartDrag = {
@@ -3707,8 +4188,8 @@ private class QuickSubtitleItemRecyclerAdapter(
             text: String,
             isDragged: Boolean,
             canDelete: Boolean,
-            onUpdate: (String) -> Unit,
             onDelete: () -> Unit,
+            onEdit: () -> Unit,
             onStartDrag: () -> Unit
         ) {
             composeView.setContent {
@@ -3717,8 +4198,8 @@ private class QuickSubtitleItemRecyclerAdapter(
                     value = text,
                     isDragged = isDragged,
                     canDelete = canDelete,
-                    onUpdate = onUpdate,
                     onDelete = onDelete,
+                    onEdit = onEdit,
                     onStartDrag = onStartDrag
                 )
             }
@@ -3733,17 +4214,10 @@ private fun QuickSubtitleEditableRow(
     value: String,
     isDragged: Boolean,
     canDelete: Boolean,
-    onUpdate: (String) -> Unit,
     onDelete: () -> Unit,
+    onEdit: () -> Unit,
     onStartDrag: () -> Unit
 ) {
-    var textValue by remember(itemId) { mutableStateOf(value) }
-    LaunchedEffect(value) {
-        if (value != textValue) {
-            textValue = value
-        }
-    }
-
     val rowElevation by animateDpAsState(
         targetValue = if (isDragged) 10.dp else 0.dp,
         animationSpec = tween(
@@ -3768,23 +4242,18 @@ private fun QuickSubtitleEditableRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            OutlinedTextField(
-                value = textValue,
-                onValueChange = {
-                    textValue = it
-                    onUpdate(it)
-                },
-                modifier = Modifier.weight(1f),
-                singleLine = false,
+            Text(
+                text = value.ifBlank { "（空文本）" },
+                modifier = Modifier
+                    .weight(1f),
                 maxLines = 2,
-                shape = RoundedCornerShape(UiTokens.Radius),
-                colors = TextFieldDefaults.outlinedTextFieldColors(
-                    focusedBorderColor = MaterialTheme.colorScheme.primary,
-                    unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                    focusedLabelColor = MaterialTheme.colorScheme.primary,
-                    unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    cursorColor = MaterialTheme.colorScheme.primary
-                )
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium
+            )
+            Md2IconButton(
+                icon = "edit",
+                contentDescription = "编辑文本",
+                onClick = onEdit
             )
             Md2IconButton(
                 icon = "drag_indicator",
@@ -3829,19 +4298,23 @@ fun RealtimeScreen(viewModel: MainViewModel, state: UiState) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         item {
-            Text("输入音量", fontWeight = FontWeight.Bold)
-            LinearProgressIndicator(
-                progress = inputLevel.coerceIn(0f, 1f),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp, bottom = 12.dp)
-            )
-            Text("当前输入设备：${state.inputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
-            Text("当前输出设备：${state.outputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
-            Text("状态：${state.status}")
-            Spacer(Modifier.height(8.dp))
-            Text("识别结果", fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(4.dp))
+            Md2StaggeredFloatIn(index = 0) {
+                Column {
+                    Text("输入音量", fontWeight = FontWeight.Bold)
+                    LinearProgressIndicator(
+                        progress = inputLevel.coerceIn(0f, 1f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp, bottom = 12.dp)
+                    )
+                    Text("当前输入设备：${state.inputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+                    Text("当前输出设备：${state.outputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+                    Text("状态：${state.status}")
+                    Spacer(Modifier.height(8.dp))
+                    Text("识别结果", fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(4.dp))
+                }
+            }
         }
 
         if (recognized.isEmpty()) {
@@ -3850,103 +4323,6 @@ fun RealtimeScreen(viewModel: MainViewModel, state: UiState) {
             }
         } else {
             items(recognized, key = { it.id }) { item ->
-                RecognizedQueueItemCard(item)
-            }
-        }
-    }
-}
-
-@Composable
-fun TextToSpeechScreen(viewModel: MainViewModel, state: UiState) {
-    var inputText by rememberSaveable { mutableStateOf("") }
-    val queued = viewModel.realtimeRecognized
-    val canSend = inputText.trim().isNotEmpty() && state.voiceDir != null
-
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 16.dp),
-        contentPadding = PaddingValues(
-            top = UiTokens.PageTopBlank,
-            bottom = UiTokens.PageBottomBlank
-        ),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
-    ) {
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(UiTokens.Radius),
-                backgroundColor = md2CardContainerColor(),
-                elevation = UiTokens.CardElevation
-            ) {
-                Column(
-                    modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text("输入要朗读的文本", fontWeight = FontWeight.Bold)
-                    OutlinedTextField(
-                        value = inputText,
-                        onValueChange = { inputText = it },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 120.dp),
-                        label = { Text("文本内容") },
-                        maxLines = 8,
-                        shape = RoundedCornerShape(UiTokens.Radius),
-                        colors = TextFieldDefaults.outlinedTextFieldColors(
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                            focusedLabelColor = MaterialTheme.colorScheme.primary,
-                            unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                            cursorColor = MaterialTheme.colorScheme.primary
-                        )
-                    )
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Md2Button(
-                            onClick = {
-                                val text = inputText.trim()
-                                if (text.isNotEmpty()) {
-                                    viewModel.speakText(text)
-                                    inputText = ""
-                                }
-                            },
-                            enabled = canSend
-                        ) {
-                            MsIcon("send", contentDescription = "发送朗读")
-                            Spacer(Modifier.width(6.dp))
-                            Text("发送")
-                        }
-                        Md2TextButton(
-                            onClick = { inputText = "" },
-                            enabled = inputText.isNotEmpty()
-                        ) {
-                            MsIcon("close", contentDescription = "清空输入")
-                            Spacer(Modifier.width(6.dp))
-                            Text("清空")
-                        }
-                    }
-                    if (state.voiceDir == null) {
-                        Text("请先在“语音包”页面选择一个语音包。", style = MaterialTheme.typography.bodySmall)
-                    } else {
-                        Text("当前语音包：${state.voiceDir.absolutePath}", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-            }
-        }
-
-        item {
-            Text("朗读队列", fontWeight = FontWeight.Bold)
-        }
-
-        if (queued.isEmpty()) {
-            item {
-                Text("暂无队列内容", style = MaterialTheme.typography.bodySmall)
-            }
-        } else {
-            items(queued, key = { it.id }) { item ->
                 RecognizedQueueItemCard(item)
             }
         }
@@ -4647,76 +5023,83 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
     ) {
         Spacer(Modifier.height(UiTokens.PageTopBlank))
 
-        Md2SettingsCard(title = "模型与资源") {
-            Text("ASR 模型 (sosv-int8.zip)", fontWeight = FontWeight.Bold)
-            Text(state.asrDir?.absolutePath ?: "未导入", style = MaterialTheme.typography.bodySmall)
-            Md2Button(onClick = { asrPicker.launch("*/*") }) {
-                Text("导入 ASR 模型")
+        Md2StaggeredFloatIn(index = 0) {
+            Md2SettingsCard(title = "模型与资源") {
+                Text("ASR 模型 (sosv-int8.zip)", fontWeight = FontWeight.Bold)
+                Text(state.asrDir?.absolutePath ?: "未导入", style = MaterialTheme.typography.bodySmall)
+                Md2Button(onClick = { asrPicker.launch("*/*") }) {
+                    Text("导入 ASR 模型")
+                }
             }
         }
 
-        Md2SettingsCard(title = "设备监控") {
-            val realtimeInputLevel = viewModel.realtimeInputLevel
-            Text("输入音量", fontWeight = FontWeight.Bold)
-            LinearProgressIndicator(
-                progress = realtimeInputLevel.coerceIn(0f, 1f),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp, bottom = 8.dp)
-            )
-            Text("当前输入设备：${state.inputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
-            Text("当前输出设备：${state.outputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+        Md2StaggeredFloatIn(index = 1) {
+            Md2SettingsCard(title = "设备监控") {
+                val realtimeInputLevel = viewModel.realtimeInputLevel
+                Text("输入音量", fontWeight = FontWeight.Bold)
+                LinearProgressIndicator(
+                    progress = realtimeInputLevel.coerceIn(0f, 1f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp, bottom = 8.dp)
+                )
+                Text("当前输入设备：${state.inputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+                Text("当前输出设备：${state.outputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+            }
         }
 
-        Md2SettingsCard(title = "系统与布局") {
-            Text("横屏抽屉模式", fontWeight = FontWeight.Bold)
-            Box {
-                Md2OutlinedButton(onClick = { drawerModeExpanded = true }) {
-                    val label = drawerModeOptions.firstOrNull { it.first == state.landscapeDrawerMode }?.second
-                        ?: drawerModeOptions.first().second
-                    Text(label)
-                }
-                DropdownMenu(
-                    expanded = drawerModeExpanded,
-                    onDismissRequest = { drawerModeExpanded = false }
-                ) {
-                    drawerModeOptions.forEach { (value, label) ->
-                        M2DropdownMenuItem(
-                            onClick = {
-                                drawerModeExpanded = false
-                                viewModel.setLandscapeDrawerMode(value)
-                            }
-                        ) { Text(label) }
+        Md2StaggeredFloatIn(index = 2) {
+            Md2SettingsCard(title = "系统与布局") {
+                Text("横屏抽屉模式", fontWeight = FontWeight.Bold)
+                Box {
+                    Md2OutlinedButton(onClick = { drawerModeExpanded = true }) {
+                        val label = drawerModeOptions.firstOrNull { it.first == state.landscapeDrawerMode }?.second
+                            ?: drawerModeOptions.first().second
+                        Text(label)
+                    }
+                    DropdownMenu(
+                        expanded = drawerModeExpanded,
+                        onDismissRequest = { drawerModeExpanded = false }
+                    ) {
+                        drawerModeOptions.forEach { (value, label) ->
+                            M2DropdownMenuItem(
+                                onClick = {
+                                    drawerModeExpanded = false
+                                    viewModel.setLandscapeDrawerMode(value)
+                                }
+                            ) { Text(label) }
+                        }
                     }
                 }
-            }
-            Text("竖屏始终为隐藏式；该选项仅影响横屏布局。", style = MaterialTheme.typography.bodySmall)
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Md2Switch(
-                    checked = state.solidTopBar,
-                    onCheckedChange = { viewModel.setSolidTopBar(it) }
-                )
-                Text("使用纯色顶栏")
-            }
-            Text("开启后顶栏与状态栏颜色改为卡片同款自适应配色。", style = MaterialTheme.typography.bodySmall)
+                Text("竖屏始终为隐藏式；该选项仅影响横屏布局。", style = MaterialTheme.typography.bodySmall)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Md2Switch(
+                        checked = state.solidTopBar,
+                        onCheckedChange = { viewModel.setSolidTopBar(it) }
+                    )
+                    Text("使用纯色顶栏")
+                }
+                Text("开启后顶栏与状态栏颜色改为卡片同款自适应配色。", style = MaterialTheme.typography.bodySmall)
 
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Md2Switch(
-                    checked = state.keepAlive,
-                    onCheckedChange = { viewModel.setKeepAlive(it) }
-                )
-                Text("保持后台运行")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Md2Switch(
+                        checked = state.keepAlive,
+                        onCheckedChange = { viewModel.setKeepAlive(it) }
+                    )
+                    Text("保持后台运行")
+                }
+                Text("开启后启用前台服务，锁屏/息屏也持续工作", style = MaterialTheme.typography.bodySmall)
             }
-            Text("开启后启用前台服务，锁屏/息屏也持续工作", style = MaterialTheme.typography.bodySmall)
         }
 
-        Md2SettingsCard(title = "识别与转换") {
+        Md2StaggeredFloatIn(index = 3) {
+            Md2SettingsCard(title = "识别与转换") {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -4771,8 +5154,10 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
             }
             Text("示例：2000 → 二零零零 / 两千", style = MaterialTheme.typography.bodySmall)
         }
+        }
 
-        Md2SettingsCard(title = "回声与降噪") {
+        Md2StaggeredFloatIn(index = 4) {
+            Md2SettingsCard(title = "回声与降噪") {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -4811,8 +5196,10 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
             Text(state.aec3Diag, style = MaterialTheme.typography.bodySmall)
             Text("需渲染参考音频，可能与系统AEC冲突", style = MaterialTheme.typography.bodySmall)
         }
+        }
 
-        Md2SettingsCard(title = "设备路由") {
+        Md2StaggeredFloatIn(index = 5) {
+            Md2SettingsCard(title = "设备路由") {
             Text("优先选择的音频输入设备类型", style = MaterialTheme.typography.bodySmall)
             Box {
                 Md2OutlinedButton(onClick = { inputTypeExpanded = true }) {
@@ -4859,6 +5246,7 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
             }
             Text("适配扬声器、听筒、蓝牙、USB、有线等输出设备", style = MaterialTheme.typography.bodySmall)
         }
+        }
 
         Spacer(Modifier.height(UiTokens.PageBottomBlank))
     }
@@ -4879,7 +5267,7 @@ private fun Md2SettingsCard(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
             content = {
-                Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Md2CardTitleText(title)
                 content()
             }
         )
@@ -4887,7 +5275,9 @@ private fun Md2SettingsCard(
 }
 
 @Composable
-fun LogScreen() {
+fun LogScreen(
+    onTopBarActionsChange: (LogTopBarActions?) -> Unit
+) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
     var logs by remember { mutableStateOf<List<File>>(emptyList()) }
@@ -4895,6 +5285,7 @@ fun LogScreen() {
     var content by remember { mutableStateOf("加载中...") }
     var expanded by remember { mutableStateOf(false) }
     val scroll = rememberScrollState()
+    val onTopBarActionsChangeState = rememberUpdatedState(onTopBarActionsChange)
 
     fun refreshLogs() {
         logs = AppLogger.listLogFiles(context)
@@ -4918,40 +5309,15 @@ fun LogScreen() {
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Box {
-                Md2OutlinedButton(onClick = { expanded = true }) {
-                    Text(selected?.name ?: "选择日志")
-                }
-                DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                    logs.forEach { file ->
-                        M2DropdownMenuItem(
-                            onClick = {
-                                selected = file
-                                expanded = false
-                            }
-                        ) { Text(file.name) }
-                    }
-                }
-            }
-            Md2Button(onClick = { refreshLogs() }) { Text("刷新") }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Md2Button(
-                onClick = {
+    SideEffect {
+        onTopBarActionsChangeState.value(
+            LogTopBarActions(
+                onRefresh = { refreshLogs() },
+                onCopy = {
                     clipboard.setText(AnnotatedString(content))
                     toast(context, "已复制")
                 },
-                enabled = content.isNotBlank()
-            ) { Text("复制") }
-            Md2Button(
-                onClick = {
+                onShare = {
                     val file = selected
                     if (file != null) {
                         shareLogFile(context, file)
@@ -4959,25 +5325,68 @@ fun LogScreen() {
                         toast(context, "暂无可分享日志")
                     }
                 },
-                enabled = selected != null
-            ) { Text("分享") }
+                canCopy = content.isNotBlank(),
+                canShare = selected != null
+            )
+        )
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            onTopBarActionsChangeState.value(null)
         }
-        if (selected != null) {
-            Text("路径：${selected!!.absolutePath}", style = MaterialTheme.typography.bodySmall)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(Modifier.height(UiTokens.PageTopBlank))
+        Md2StaggeredFloatIn(index = 0) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box {
+                    Md2OutlinedButton(onClick = { expanded = true }) {
+                        Text(selected?.name ?: "选择日志")
+                    }
+                    DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                        logs.forEach { file ->
+                            M2DropdownMenuItem(
+                                onClick = {
+                                    selected = file
+                                    expanded = false
+                                }
+                            ) { Text(file.name) }
+                        }
+                    }
+                }
+            }
+        }
+        Md2StaggeredFloatIn(index = 1) {
+            if (selected != null) {
+                Text("路径：${selected!!.absolutePath}", style = MaterialTheme.typography.bodySmall)
+            }
         }
         Divider()
-        SelectionContainer(
+        Md2StaggeredFloatIn(
+            index = 2,
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .verticalScroll(scroll)
         ) {
-            Text(
-                content,
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.bodySmall
-            )
+            SelectionContainer(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(scroll)
+            ) {
+                Text(
+                    content,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         }
+        Spacer(Modifier.height(UiTokens.PageBottomBlank))
     }
 }
 
