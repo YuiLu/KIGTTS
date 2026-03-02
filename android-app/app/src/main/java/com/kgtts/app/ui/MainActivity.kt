@@ -30,6 +30,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -118,6 +119,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.interpolator.view.animation.FastOutSlowInInterpolator
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -2159,26 +2162,55 @@ fun AppScaffold(viewModel: MainViewModel) {
     BackHandler(enabled = quickSubtitleImmersive) {
         quickSubtitleFullscreen = false
     }
+    LaunchedEffect(fullScreenImmersive) {
+        if (fullScreenImmersive) {
+            drawerExpanded = false
+            drawerState.close()
+        }
+    }
+    LaunchedEffect(drawingImmersive, inMultiWindowMode) {
+        val window = activity?.window ?: return@LaunchedEffect
+        val controller = WindowCompat.getInsetsController(window, window.decorView) ?: return@LaunchedEffect
+        if (drawingImmersive && !inMultiWindowMode) {
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(WindowInsetsCompat.Type.statusBars())
+            AppLogger.i("AppScaffold.statusBars=hidden drawingImmersive=true")
+        } else {
+            controller.show(WindowInsetsCompat.Type.statusBars())
+            AppLogger.i("AppScaffold.statusBars=shown drawingImmersive=false")
+        }
+    }
+    val topBarVisible = !fullScreenImmersive
+    val animatedPermanentRailWidth by animateDpAsState(
+        targetValue = if (topBarVisible) permanentDrawerCollapsedWidth else 0.dp,
+        animationSpec = tween(durationMillis = 160, easing = FastOutSlowInEasing),
+        label = "permanent_drawer_rail_width"
+    )
+    val animatedContentStartPadding by animateDpAsState(
+        targetValue = if (fullScreenImmersive) landscapeCutoutStart else 0.dp,
+        animationSpec = tween(durationMillis = 160, easing = FastOutSlowInEasing),
+        label = "content_start_padding"
+    )
     Box(modifier = Modifier.fillMaxSize()) {
-        Crossfade(
-            targetState = fullScreenImmersive,
-            animationSpec = tween(durationMillis = 150),
-            label = "fullscreen_switch"
-        ) { immersive ->
-            if (immersive) {
+        if (usePermanentDrawer) {
             Scaffold(
-                backgroundColor = MaterialTheme.colorScheme.background
-            ) { innerPadding ->
-                contentArea(
-                    Modifier
-                        .fillMaxSize()
-                        .padding(innerPadding)
-                        .padding(start = landscapeCutoutStart, end = landscapeCutoutEnd)
-                )
-            }
-            } else if (usePermanentDrawer) {
-            Scaffold(
-                topBar = { topBar { drawerExpanded = !drawerExpanded } },
+                topBar = {
+                    AnimatedVisibility(
+                        visible = topBarVisible,
+                        enter = fadeIn(animationSpec = tween(130)) +
+                                expandVertically(
+                                    expandFrom = Alignment.Top,
+                                    animationSpec = tween(180, easing = FastOutSlowInEasing)
+                                ),
+                        exit = fadeOut(animationSpec = tween(100)) +
+                                shrinkVertically(
+                                    shrinkTowards = Alignment.Top,
+                                    animationSpec = tween(140, easing = FastOutSlowInEasing)
+                                )
+                    ) {
+                        topBar { drawerExpanded = !drawerExpanded }
+                    }
+                },
                 floatingActionButton = fab,
                 backgroundColor = MaterialTheme.colorScheme.background
             ) { innerPadding ->
@@ -2190,24 +2222,28 @@ fun AppScaffold(viewModel: MainViewModel) {
                     Row(modifier = Modifier.fillMaxSize()) {
                         Surface(
                             modifier = Modifier
-                                .width(permanentDrawerCollapsedWidth)
+                                .width(animatedPermanentRailWidth)
                                 .fillMaxHeight()
                                 .zIndex(3f),
                             shape = RectangleShape,
                             color = MaterialTheme.colorScheme.surface,
-                            elevation = UiTokens.MenuElevation
+                            elevation = if (animatedPermanentRailWidth > 0.dp) UiTokens.MenuElevation else 0.dp
                         ) {
-                            AppDrawerContent(
-                                items = drawerItems,
-                                page = drawerSelectedPage,
-                                expanded = false,
-                                applyStatusBarPadding = false,
-                                showHeader = false,
-                                showTopDivider = false,
-                                topInset = 8.dp,
-                                horizontalStartInset = landscapeCutoutStart,
-                                onSelect = { page = it }
-                            )
+                            if (animatedPermanentRailWidth > 0.5.dp) {
+                                AppDrawerContent(
+                                    items = drawerItems,
+                                    page = drawerSelectedPage,
+                                    expanded = false,
+                                    applyStatusBarPadding = false,
+                                    showHeader = false,
+                                    showTopDivider = false,
+                                    topInset = 8.dp,
+                                    horizontalStartInset = landscapeCutoutStart,
+                                    onSelect = { page = it }
+                                )
+                            } else {
+                                Box(modifier = Modifier.fillMaxSize())
+                            }
                         }
                         contentArea(
                             Modifier
@@ -2215,12 +2251,12 @@ fun AppScaffold(viewModel: MainViewModel) {
                                 .fillMaxHeight()
                                 .graphicsLayer { clip = true }
                                 .zIndex(0f)
-                                .padding(end = landscapeCutoutEnd)
+                                .padding(start = animatedContentStartPadding, end = landscapeCutoutEnd)
                         )
                     }
 
                     AnimatedVisibility(
-                        visible = drawerExpanded,
+                        visible = drawerExpanded && topBarVisible,
                         modifier = Modifier
                             .matchParentSize()
                             .zIndex(3f),
@@ -2276,7 +2312,7 @@ fun AppScaffold(viewModel: MainViewModel) {
                     }
                 }
             }
-            } else {
+        } else {
             ModalDrawer(
                 drawerState = drawerState,
                 drawerShape = RectangleShape,
@@ -2325,7 +2361,23 @@ fun AppScaffold(viewModel: MainViewModel) {
                 }
             ) {
                 Scaffold(
-                    topBar = { topBar { scope.launch { drawerState.open() } } },
+                    topBar = {
+                        AnimatedVisibility(
+                            visible = topBarVisible,
+                            enter = fadeIn(animationSpec = tween(130)) +
+                                    expandVertically(
+                                        expandFrom = Alignment.Top,
+                                        animationSpec = tween(180, easing = FastOutSlowInEasing)
+                                    ),
+                            exit = fadeOut(animationSpec = tween(100)) +
+                                    shrinkVertically(
+                                        shrinkTowards = Alignment.Top,
+                                        animationSpec = tween(140, easing = FastOutSlowInEasing)
+                                    )
+                        ) {
+                            topBar { scope.launch { drawerState.open() } }
+                        }
+                    },
                     floatingActionButton = fab,
                     backgroundColor = MaterialTheme.colorScheme.background
                     ) { innerPadding ->
@@ -2337,7 +2389,6 @@ fun AppScaffold(viewModel: MainViewModel) {
                         )
                     }
                 }
-        }
         }
     }
 }
@@ -3203,11 +3254,7 @@ private fun QuickSubtitleNavHost(
             if (initialState.destination.route == QuickSubtitleRoutes.Main &&
                 targetState.destination.route == QuickSubtitleRoutes.Editor
             ) {
-                fadeIn(animationSpec = tween(180)) +
-                        androidx.compose.animation.slideInHorizontally(
-                            initialOffsetX = { full -> full / 3 },
-                            animationSpec = tween(220, easing = FastOutSlowInEasing)
-                        )
+                fadeIn(animationSpec = tween(180))
             } else {
                 fadeIn(animationSpec = tween(120))
             }
@@ -3216,11 +3263,7 @@ private fun QuickSubtitleNavHost(
             if (initialState.destination.route == QuickSubtitleRoutes.Main &&
                 targetState.destination.route == QuickSubtitleRoutes.Editor
             ) {
-                fadeOut(animationSpec = tween(120)) +
-                        androidx.compose.animation.slideOutHorizontally(
-                            targetOffsetX = { full -> -full / 6 },
-                            animationSpec = tween(180, easing = FastOutSlowInEasing)
-                        )
+                fadeOut(animationSpec = tween(130))
             } else {
                 fadeOut(animationSpec = tween(90))
             }
@@ -3229,11 +3272,7 @@ private fun QuickSubtitleNavHost(
             if (initialState.destination.route == QuickSubtitleRoutes.Editor &&
                 targetState.destination.route == QuickSubtitleRoutes.Main
             ) {
-                fadeIn(animationSpec = tween(160)) +
-                        androidx.compose.animation.slideInHorizontally(
-                            initialOffsetX = { full -> -full / 4 },
-                            animationSpec = tween(180, easing = FastOutSlowInEasing)
-                        )
+                fadeIn(animationSpec = tween(170))
             } else {
                 fadeIn(animationSpec = tween(120))
             }
@@ -3242,11 +3281,7 @@ private fun QuickSubtitleNavHost(
             if (initialState.destination.route == QuickSubtitleRoutes.Editor &&
                 targetState.destination.route == QuickSubtitleRoutes.Main
             ) {
-                fadeOut(animationSpec = tween(120)) +
-                        androidx.compose.animation.slideOutHorizontally(
-                            targetOffsetX = { full -> full / 4 },
-                            animationSpec = tween(180, easing = FastOutSlowInEasing)
-                        )
+                fadeOut(animationSpec = tween(130))
             } else {
                 fadeOut(animationSpec = tween(90))
             }
@@ -3306,8 +3341,13 @@ fun QuickSubtitleScreen(
     }
     val hasVoice = state.voiceDir != null
     val statusBarInsetTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    val quickSubtitleTopBlank =
+    val quickSubtitleTopBlankTarget =
         if (fullscreenMode) (statusBarInsetTop + UiTokens.PageTopBlank) else UiTokens.PageTopBlank
+    val quickSubtitleTopBlank by animateDpAsState(
+        targetValue = quickSubtitleTopBlankTarget,
+        animationSpec = tween(180, easing = FastOutSlowInEasing),
+        label = "quick_subtitle_top_blank"
+    )
     DisposableEffect(lifecycleOwner, focusManager) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE) {
@@ -4521,6 +4561,7 @@ fun DrawingBoardScreen(
     val boardOutlineColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.65f)
     val boardFillColor = if (isDark) Color(0xFF2C3237) else Color(0xFFFCFDFE)
     val currentPoints = remember { mutableStateListOf<DrawPoint>() }
+    var toolbarCollapsed by rememberSaveable { mutableStateOf(false) }
     val palette = if (isDark) {
         listOf(
             Color(0xFF7DE8EA),
@@ -4543,12 +4584,49 @@ fun DrawingBoardScreen(
         )
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .padding(if (fullscreen) 0.dp else 16.dp)
     ) {
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val contentHorizontalPadding = if (fullscreen) 0.dp else 16.dp
+        val contentVerticalPadding = if (fullscreen) 0.dp else 16.dp
+
+        val leftActionButtonSize = 36.dp
+        val leftColorDotSize = 22.dp
+        val leftItemSpacing = 8.dp
+        val fixedActionCount = 3
+        val fixedColorCount = 7
+        val fixedMaxToolbarHeight =
+            (leftActionButtonSize * fixedActionCount) +
+            (leftItemSpacing * (fixedActionCount - 1)) +
+            leftItemSpacing + // action section -> color section gap
+            (leftColorDotSize * fixedColorCount) +
+            (leftItemSpacing * (fixedColorCount - 1)) +
+            (10.dp * 2) // card inner vertical padding
+
+        val landscapeToolbarHeight = remember(maxHeight, fixedMaxToolbarHeight) {
+            val verticalSafetyPadding = 16.dp
+            val availableHeight = (maxHeight - verticalSafetyPadding * 2).coerceAtLeast(96.dp)
+            minOf(availableHeight, fixedMaxToolbarHeight)
+        }
+        val fixedMaxToolbarWidth =
+            (leftActionButtonSize * fixedActionCount) +
+            (leftItemSpacing * (fixedActionCount - 1)) +
+            10.dp + // left action row -> color row gap
+            (leftColorDotSize * fixedColorCount) +
+            (leftItemSpacing * (fixedColorCount - 1)) +
+            (10.dp * 2) // card inner horizontal padding
+        val portraitToolbarWidth = remember(maxWidth, fixedMaxToolbarWidth) {
+            val horizontalSafetyPadding = 12.dp
+            val availableWidth = (maxWidth - horizontalSafetyPadding * 2).coerceAtLeast(200.dp)
+            minOf(availableWidth, fixedMaxToolbarWidth)
+        }
+
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = contentHorizontalPadding, vertical = contentVerticalPadding)
+        ) {
             val canvasW = constraints.maxWidth.toFloat()
             val canvasH = constraints.maxHeight.toFloat()
             val boardAspect = 1080f / 1920f
@@ -4649,30 +4727,44 @@ fun DrawingBoardScreen(
             }
         }
 
+        val toolbarAnchorModifier = if (isLandscape) {
+            Modifier
+                .align(Alignment.CenterEnd)
+                .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.End))
+                .padding(end = 10.dp)
+        } else {
+            Modifier
+                .align(Alignment.BottomCenter)
+                .windowInsetsPadding(WindowInsets.navigationBars.only(WindowInsetsSides.Bottom))
+                .padding(bottom = 10.dp)
+        }
+
         DrawingToolbar(
-            modifier = if (isLandscape) {
-                Modifier
-                    .align(Alignment.CenterEnd)
-                    .padding(end = 10.dp)
-                    .navigationBarsPadding()
-            } else {
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 10.dp)
-                    .navigationBarsPadding()
-            },
+            modifier = toolbarAnchorModifier,
             isLandscape = isLandscape,
             colors = palette,
             selectedColor = viewModel.drawColor,
             brushSize = viewModel.drawBrushSize,
             eraserSize = viewModel.drawEraserSize,
             eraserEnabled = viewModel.drawEraser,
+            visible = !toolbarCollapsed,
             fullscreen = fullscreen,
             onToggleFullscreen = onToggleFullscreen,
+            onToggleCollapsed = { toolbarCollapsed = !toolbarCollapsed },
+            landscapeToolbarHeight = landscapeToolbarHeight,
+            portraitToolbarWidth = portraitToolbarWidth,
             onPickColor = { viewModel.updateDrawColor(it) },
             onBrushSize = { viewModel.updateDrawBrushSize(it) },
             onToggleEraser = { viewModel.updateDrawEraser(it) },
             onClear = { viewModel.clearDrawingBoard() }
+        )
+        DrawingToolbarMini(
+            modifier = toolbarAnchorModifier,
+            isLandscape = isLandscape,
+            visible = toolbarCollapsed,
+            fullscreen = fullscreen,
+            onToggleFullscreen = onToggleFullscreen,
+            onToggleCollapsed = { toolbarCollapsed = !toolbarCollapsed }
         )
     }
 }
@@ -4686,106 +4778,64 @@ private fun DrawingToolbar(
     brushSize: Float,
     eraserSize: Float,
     eraserEnabled: Boolean,
+    visible: Boolean,
     fullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
+    onToggleCollapsed: () -> Unit,
+    landscapeToolbarHeight: Dp,
+    portraitToolbarWidth: Dp,
     onPickColor: (Color) -> Unit,
     onBrushSize: (Float) -> Unit,
     onToggleEraser: (Boolean) -> Unit,
     onClear: () -> Unit
 ) {
-    Card(
+    AnimatedVisibility(
         modifier = modifier,
-        shape = RoundedCornerShape(UiTokens.Radius),
-        backgroundColor = md2CardContainerColor(),
-        elevation = 6.dp
-    ) {
-        val activeSize = if (eraserEnabled) eraserSize else brushSize
-        if (isLandscape) {
-            Row(
-                modifier = Modifier
-                    .padding(10.dp)
-                    .height(248.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.Top
-            ) {
-                Column(
-                    modifier = Modifier.fillMaxHeight(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Md2ToolToggle(
-                        icon = "edit",
-                        selected = !eraserEnabled,
-                        onClick = { onToggleEraser(false) },
-                        contentDescription = "画笔"
-                    )
-                    Md2ToolToggle(
-                        icon = "ink_eraser",
-                        selected = eraserEnabled,
-                        onClick = { onToggleEraser(true) },
-                        contentDescription = "橡皮擦"
-                    )
-                    Md2ToolToggle(
-                        icon = "delete_sweep",
-                        selected = false,
-                        onClick = onClear,
-                        contentDescription = "清空"
-                    )
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .width(34.dp)
-                            .verticalScroll(rememberScrollState()),
-                        contentAlignment = Alignment.TopCenter
-                    ) {
-                        Column(
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            colors.forEach { color ->
-                                Md2ColorDot(
-                                    color = color,
-                                    selected = !eraserEnabled && selectedColor == color,
-                                    onClick = { onPickColor(color) }
-                                )
-                            }
-                        }
-                    }
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .width(52.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Md2VerticalSlider(
-                        value = activeSize,
-                        onValueChange = onBrushSize,
-                        valueRange = 2f..48f,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                    Md2ToolToggle(
-                        icon = if (fullscreen) "fullscreen_exit" else "fullscreen",
-                        selected = false,
-                        onClick = onToggleFullscreen,
-                        contentDescription = if (fullscreen) "退出全屏" else "进入全屏"
-                    )
-                }
-            }
+        visible = visible,
+        enter = if (isLandscape) {
+            fadeIn(animationSpec = tween(130)) + androidx.compose.animation.slideInHorizontally(
+                initialOffsetX = { full -> full / 2 },
+                animationSpec = tween(180, easing = FastOutSlowInEasing)
+            )
         } else {
-            Column(
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
+            fadeIn(animationSpec = tween(130)) + slideInVertically(
+                initialOffsetY = { full -> full / 2 },
+                animationSpec = tween(180, easing = FastOutSlowInEasing)
+            )
+        },
+        exit = if (isLandscape) {
+            fadeOut(animationSpec = tween(100)) + androidx.compose.animation.slideOutHorizontally(
+                targetOffsetX = { full -> full / 2 },
+                animationSpec = tween(140, easing = FastOutSlowInEasing)
+            )
+        } else {
+            fadeOut(animationSpec = tween(100)) + slideOutVertically(
+                targetOffsetY = { full -> full / 2 },
+                animationSpec = tween(140, easing = FastOutSlowInEasing)
+            )
+        }
+    ) {
+        Card(
+            modifier = if (isLandscape) Modifier else Modifier.width(portraitToolbarWidth),
+            shape = RoundedCornerShape(UiTokens.Radius),
+            backgroundColor = md2CardContainerColor(),
+            elevation = 6.dp
+        ) {
+            val activeSize = if (eraserEnabled) eraserSize else brushSize
+            if (isLandscape) {
                 Row(
+                    modifier = Modifier
+                        .padding(10.dp)
+                        .height(landscapeToolbarHeight),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    Column(
+                        modifier = Modifier
+                            .width(36.dp)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Md2ToolToggle(
                             icon = "edit",
@@ -4805,32 +4855,206 @@ private fun DrawingToolbar(
                             onClick = onClear,
                             contentDescription = "清空"
                         )
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState()),
+                            contentAlignment = Alignment.TopCenter
+                        ) {
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                colors.forEach { color ->
+                                    Md2ColorDot(
+                                        color = color,
+                                        selected = !eraserEnabled && selectedColor == color,
+                                        onClick = { onPickColor(color) }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Column(
+                        modifier = Modifier
+                            .width(52.dp)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                        ) {
+                            Md2VerticalSlider(
+                                value = activeSize,
+                                onValueChange = onBrushSize,
+                                valueRange = 2f..48f,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                        Md2ToolToggle(
+                            icon = "chevron_right",
+                            selected = false,
+                            onClick = onToggleCollapsed,
+                            contentDescription = "折叠工具栏"
+                        )
+                        Md2ToolToggle(
+                            icon = if (fullscreen) "fullscreen_exit" else "fullscreen",
+                            selected = false,
+                            onClick = onToggleFullscreen,
+                            contentDescription = if (fullscreen) "退出全屏" else "进入全屏"
+                        )
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Md2ToolToggle(
+                                icon = "edit",
+                                selected = !eraserEnabled,
+                                onClick = { onToggleEraser(false) },
+                                contentDescription = "画笔"
+                            )
+                            Md2ToolToggle(
+                                icon = "ink_eraser",
+                                selected = eraserEnabled,
+                                onClick = { onToggleEraser(true) },
+                                contentDescription = "橡皮擦"
+                            )
+                            Md2ToolToggle(
+                                icon = "delete_sweep",
+                                selected = false,
+                                onClick = onClear,
+                                contentDescription = "清空"
+                            )
+                        }
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            colors.forEach { color ->
+                                Md2ColorDot(
+                                    color = color,
+                                    selected = !eraserEnabled && selectedColor == color,
+                                    onClick = { onPickColor(color) }
+                                )
+                            }
+                        }
                     }
                     Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        colors.forEach { color ->
-                            Md2ColorDot(
-                                color = color,
-                                selected = !eraserEnabled && selectedColor == color,
-                                onClick = { onPickColor(color) }
-                            )
-                        }
+                        Slider(
+                            value = activeSize,
+                            onValueChange = onBrushSize,
+                            valueRange = 2f..48f,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Md2ToolToggle(
+                            icon = "expand_more",
+                            selected = false,
+                            onClick = onToggleCollapsed,
+                            contentDescription = "折叠工具栏"
+                        )
+                        Md2ToolToggle(
+                            icon = if (fullscreen) "fullscreen_exit" else "fullscreen",
+                            selected = false,
+                            onClick = onToggleFullscreen,
+                            contentDescription = if (fullscreen) "退出全屏" else "进入全屏"
+                        )
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DrawingToolbarMini(
+    modifier: Modifier = Modifier,
+    isLandscape: Boolean,
+    visible: Boolean,
+    fullscreen: Boolean,
+    onToggleFullscreen: () -> Unit,
+    onToggleCollapsed: () -> Unit
+) {
+    AnimatedVisibility(
+        modifier = modifier,
+        visible = visible,
+        enter = if (isLandscape) {
+            fadeIn(animationSpec = tween(130)) + androidx.compose.animation.slideInHorizontally(
+                initialOffsetX = { full -> full / 2 },
+                animationSpec = tween(180, easing = FastOutSlowInEasing)
+            )
+        } else {
+            fadeIn(animationSpec = tween(130)) + slideInVertically(
+                initialOffsetY = { full -> full / 2 },
+                animationSpec = tween(180, easing = FastOutSlowInEasing)
+            )
+        },
+        exit = if (isLandscape) {
+            fadeOut(animationSpec = tween(100)) + androidx.compose.animation.slideOutHorizontally(
+                targetOffsetX = { full -> full / 2 },
+                animationSpec = tween(140, easing = FastOutSlowInEasing)
+            )
+        } else {
+            fadeOut(animationSpec = tween(100)) + slideOutVertically(
+                targetOffsetY = { full -> full / 2 },
+                animationSpec = tween(140, easing = FastOutSlowInEasing)
+            )
+        }
+    ) {
+        Card(
+            shape = RoundedCornerShape(UiTokens.Radius),
+            backgroundColor = md2CardContainerColor(),
+            elevation = 6.dp
+        ) {
+            if (isLandscape) {
+                Column(
+                    modifier = Modifier.padding(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Md2ToolToggle(
+                        icon = "chevron_left",
+                        selected = false,
+                        onClick = onToggleCollapsed,
+                        contentDescription = "展开工具栏"
+                    )
+                    Md2ToolToggle(
+                        icon = if (fullscreen) "fullscreen_exit" else "fullscreen",
+                        selected = false,
+                        onClick = onToggleFullscreen,
+                        contentDescription = if (fullscreen) "退出全屏" else "进入全屏"
+                    )
+                }
+            } else {
                 Row(
+                    modifier = Modifier.padding(8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Slider(
-                        value = activeSize,
-                        onValueChange = onBrushSize,
-                        valueRange = 2f..48f,
-                        modifier = Modifier.weight(1f)
+                    Md2ToolToggle(
+                        icon = "expand_less",
+                        selected = false,
+                        onClick = onToggleCollapsed,
+                        contentDescription = "展开工具栏"
                     )
                     Md2ToolToggle(
                         icon = if (fullscreen) "fullscreen_exit" else "fullscreen",
@@ -4907,7 +5131,6 @@ private fun Md2VerticalSlider(
     BoxWithConstraints(
         modifier = modifier
             .clip(RoundedCornerShape(26.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
             .pointerInput(min, max) {
                 fun yToValue(y: Float): Float {
                     val h = size.height.toFloat().coerceAtLeast(1f)
