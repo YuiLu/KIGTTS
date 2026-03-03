@@ -13,6 +13,7 @@ import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.view.MotionEvent
 import android.view.Surface
@@ -38,6 +39,8 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
@@ -116,6 +119,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
@@ -209,6 +213,24 @@ private fun normalizeDrawingSaveRelativePath(raw: String): String {
         UserPrefs.DEFAULT_DRAWING_SAVE_RELATIVE_PATH
     } else {
         normalized
+    }
+}
+
+private fun drawingRelativePathFromTreeUri(uri: android.net.Uri): String? {
+    val treeId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull() ?: return null
+    val sep = treeId.indexOf(':')
+    if (sep <= 0 || sep >= treeId.length - 1) return null
+    val volume = treeId.substring(0, sep).lowercase(Locale.US)
+    val rawPath = treeId.substring(sep + 1)
+    return when (volume) {
+        "primary" -> normalizeDrawingSaveRelativePath(rawPath)
+        "home" -> {
+            val tail = rawPath.trim().trim('/')
+            normalizeDrawingSaveRelativePath(
+                if (tail.isEmpty()) "Documents" else "Documents/$tail"
+            )
+        }
+        else -> null
     }
 }
 
@@ -538,11 +560,12 @@ class MainViewModel(
         saveQuickSubtitleConfig()
     }
 
-    fun addQuickSubtitleItem(groupIndex: Int) {
+    fun addQuickSubtitleItem(groupIndex: Int, value: String = "新快捷文本") {
         if (groupIndex !in quickSubtitleGroups.indices) return
+        val text = value.trim().ifEmpty { "新快捷文本" }
         val next = quickSubtitleGroups.toMutableList()
         val g = next[groupIndex]
-        next[groupIndex] = g.copy(items = g.items + "新快捷文本")
+        next[groupIndex] = g.copy(items = g.items + text)
         quickSubtitleGroups = next
         saveQuickSubtitleConfig()
     }
@@ -955,6 +978,19 @@ class MainViewModel(
         viewModelScope.launch {
             UserPrefs.setDrawingSaveRelativePath(appContext, normalized)
         }
+    }
+
+    fun setDrawingSavePathFromTreeUri(uri: android.net.Uri) {
+        val resolved = drawingRelativePathFromTreeUri(uri)
+        if (resolved == null) {
+            uiState = uiState.copy(status = "不支持该目录，请选择内部存储目录")
+            return
+        }
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching {
+            appContext.contentResolver.takePersistableUriPermission(uri, flags)
+        }
+        setDrawingSaveRelativePath(resolved)
     }
 
     fun updateDrawColor(color: Color) {
@@ -3493,6 +3529,8 @@ fun QuickSubtitleScreen(
     onOpenEditor: () -> Unit,
     fullscreenMode: Boolean
 ) {
+    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val focusManager = LocalFocusManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val groups = viewModel.quickSubtitleGroups
@@ -3503,6 +3541,7 @@ fun QuickSubtitleScreen(
     val subtitleSize = viewModel.quickSubtitleFontSizeSp
     val inputText = viewModel.quickSubtitleInputText
     val playOnSend = viewModel.quickSubtitlePlayOnSend
+    var quickInputCollapsed by rememberSaveable { mutableStateOf(false) }
     var inputFieldValue by remember {
         mutableStateOf(
             TextFieldValue(
@@ -3528,6 +3567,24 @@ fun QuickSubtitleScreen(
         animationSpec = tween(180, easing = FastOutSlowInEasing),
         label = "quick_subtitle_top_blank"
     )
+    val landscapeQuickPanelWidth = 220.dp
+    val landscapeQuickPanelGap = 8.dp
+    val quickSubtitleBottomBlank = if (isLandscape) {
+        UiTokens.PageBottomBlank + 12.dp
+    } else {
+        UiTokens.PageBottomBlank + 92.dp
+    }
+    val quickPanelExpanded = !quickInputCollapsed
+    val quickPanelAnimatedWidth by animateDpAsState(
+        targetValue = if (isLandscape && quickPanelExpanded) landscapeQuickPanelWidth else 0.dp,
+        animationSpec = tween(220, easing = FastOutSlowInEasing),
+        label = "quick_subtitle_right_panel_width"
+    )
+    val quickPanelAnimatedAlpha by animateFloatAsState(
+        targetValue = if (isLandscape && quickPanelExpanded) 1f else 0f,
+        animationSpec = tween(160, easing = FastOutSlowInEasing),
+        label = "quick_subtitle_right_panel_alpha"
+    )
     DisposableEffect(lifecycleOwner, focusManager) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE) {
@@ -3547,191 +3604,571 @@ fun QuickSubtitleScreen(
                 .fillMaxSize()
         ) {
             Spacer(Modifier.height(quickSubtitleTopBlank))
-            Md2StaggeredFloatIn(
-                index = 0,
-                enabled = false,
-                modifier = Modifier
-                    .padding(horizontal = 16.dp)
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .heightIn(min = 260.dp)
-            ) {
-                Card(
-                    modifier = Modifier.fillMaxSize(),
-                    shape = RoundedCornerShape(UiTokens.Radius),
-                    backgroundColor = md2CardContainerColor(),
-                    elevation = UiTokens.CardElevation
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(12.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxWidth()
-                                .verticalScroll(rememberScrollState())
-                        ) {
-                            AnimatedContent(
-                                targetState = subtitleText,
-                                transitionSpec = {
-                                    ContentTransform(
-                                        targetContentEnter = fadeIn(animationSpec = tween(180)) +
-                                                slideInVertically(
-                                                    initialOffsetY = { full -> full / 6 },
-                                                    animationSpec = tween(200, easing = FastOutSlowInEasing)
-                                                ),
-                                        initialContentExit = fadeOut(animationSpec = tween(120))
-                                    )
-                                },
-                                label = "quick_subtitle_text_change"
-                            ) { text ->
-                                Text(
-                                    text = text,
-                                    style = MaterialTheme.typography.bodyLarge.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = subtitleSize.sp,
-                                        lineHeight = (subtitleSize * 1.15f).sp
-                                    )
-                                )
-                            }
-                        }
-                        Spacer(Modifier.height(8.dp))
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            MsIcon("search", contentDescription = "字体大小")
-                            Slider(
-                                value = subtitleSize,
-                                onValueChange = { viewModel.setQuickSubtitleFontSize(it) },
-                                valueRange = 28f..96f,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(8.dp))
-            Md2StaggeredFloatIn(index = 1, enabled = false) {
+            if (isLandscape) {
                 Row(
                     modifier = Modifier
+                        .padding(horizontal = 16.dp)
                         .fillMaxWidth()
-                        .height(100.dp)
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+                        .weight(1f)
+                        .heightIn(min = 260.dp),
+                    horizontalArrangement = Arrangement.spacedBy(landscapeQuickPanelGap)
                 ) {
-                    // Keep frame edges flush; reserve shadow space inside scroll content.
-                    Spacer(Modifier.width(8.dp))
-                    quickItems.forEach { text ->
+                    Md2StaggeredFloatIn(
+                        index = 0,
+                        enabled = false,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .padding(3.dp)
+                    ) {
                         Card(
-                            modifier = Modifier
-                                .padding(vertical = 3.dp)
-                                .width(148.dp)
-                                .height(94.dp)
-                                .clickable {
-                                    viewModel.applyQuickSubtitleText(
-                                        text = text,
-                                        enqueueSpeak = hasVoice
-                                    )
-                                },
+                            modifier = Modifier.fillMaxSize(),
                             shape = RoundedCornerShape(UiTokens.Radius),
                             backgroundColor = md2CardContainerColor(),
                             elevation = UiTokens.CardElevation
                         ) {
-                            Box(
+                            Row(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                                contentAlignment = Alignment.CenterStart
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Text(
-                                    text = text,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.bodyLarge
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                        .verticalScroll(rememberScrollState())
+                                ) {
+                                    AnimatedContent(
+                                        targetState = subtitleText,
+                                        transitionSpec = {
+                                            ContentTransform(
+                                                targetContentEnter = fadeIn(animationSpec = tween(180)) +
+                                                    slideInVertically(
+                                                        initialOffsetY = { full -> full / 6 },
+                                                        animationSpec = tween(200, easing = FastOutSlowInEasing)
+                                                    ),
+                                                initialContentExit = fadeOut(animationSpec = tween(120))
+                                            )
+                                        },
+                                        label = "quick_subtitle_text_change"
+                                    ) { text ->
+                                        Text(
+                                            text = text,
+                                            style = MaterialTheme.typography.bodyLarge.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = subtitleSize.sp,
+                                                lineHeight = (subtitleSize * 1.15f).sp
+                                            )
+                                        )
+                                    }
+                                }
+                                Column(
+                                    modifier = Modifier
+                                        .width(44.dp)
+                                        .fillMaxHeight(),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    MsIcon("search", contentDescription = "字体大小")
+                                    BoxWithConstraints(
+                                        modifier = Modifier
+                                            .padding(top = 8.dp, bottom = 4.dp)
+                                            .weight(1f)
+                                            .fillMaxWidth(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Slider(
+                                            value = subtitleSize,
+                                            onValueChange = { viewModel.setQuickSubtitleFontSize(it) },
+                                            valueRange = 28f..96f,
+                                            modifier = Modifier
+                                                .height(28.dp)
+                                                .width(maxHeight)
+                                                .graphicsLayer { rotationZ = -90f }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .width(quickPanelAnimatedWidth)
+                            .fillMaxHeight()
+                            .graphicsLayer { alpha = quickPanelAnimatedAlpha }
+                    ) {
+                        Md2StaggeredFloatIn(
+                            index = 1,
+                            enabled = false,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(3.dp)
+                        ) {
+                            Card(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = RoundedCornerShape(UiTokens.Radius),
+                                backgroundColor = md2CardContainerColor(),
+                                elevation = UiTokens.CardElevation
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxSize()
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxHeight()
+                                            .verticalScroll(rememberScrollState())
+                                            .padding(horizontal = 6.dp, vertical = 6.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        quickItems.forEach { text ->
+                                            Card(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(72.dp)
+                                                    .clickable {
+                                                        viewModel.applyQuickSubtitleText(
+                                                            text = text,
+                                                            enqueueSpeak = hasVoice
+                                                        )
+                                                    },
+                                                shape = RoundedCornerShape(UiTokens.Radius),
+                                                backgroundColor = md2CardContainerColor(),
+                                                elevation = UiTokens.CardElevation
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxSize()
+                                                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                                                    contentAlignment = Alignment.CenterStart
+                                                ) {
+                                                    Text(
+                                                        text = text,
+                                                        maxLines = 2,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                        style = MaterialTheme.typography.bodyLarge
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(56.dp)
+                                                .clickable {
+                                                    viewModel.addQuickSubtitleItem(
+                                                        groupIndex = selectedGroupIndex,
+                                                        value = subtitleText
+                                                    )
+                                                },
+                                            shape = RoundedCornerShape(UiTokens.Radius),
+                                            backgroundColor = md2CardContainerColor(),
+                                            elevation = UiTokens.CardElevation
+                                        ) {
+                                            Box(
+                                                modifier = Modifier.fillMaxSize(),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                MsIcon("add", contentDescription = "添加当前文本")
+                                            }
+                                        }
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxHeight()
+                                            .width(1.dp)
+                                            .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+                                    )
+                                    Column(
+                                        modifier = Modifier
+                                            .width(44.dp)
+                                            .fillMaxHeight()
+                                    ) {
+                                        Column(
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .fillMaxWidth()
+                                                .verticalScroll(rememberScrollState())
+                                                .padding(horizontal = 2.dp, vertical = 4.dp),
+                                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                                        ) {
+                                            groups.forEachIndexed { index, group ->
+                                                val selected = selectedGroupIndex == index
+                                                val tabBg =
+                                                    if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .height(44.dp)
+                                                        .clip(RoundedCornerShape(UiTokens.Radius))
+                                                        .background(tabBg)
+                                                        .clickable { viewModel.selectQuickSubtitleGroup(index) },
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    MsIcon(group.icon, contentDescription = group.title)
+                                                }
+                                            }
+                                        }
+                                        Surface(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(44.dp),
+                                            color = MaterialTheme.colorScheme.primary
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                IconButton(onClick = onOpenEditor) {
+                                                    MsIcon(
+                                                        "edit",
+                                                        contentDescription = "编辑快捷文本",
+                                                        tint = MaterialTheme.colorScheme.onPrimary
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                Md2StaggeredFloatIn(
+                    index = 0,
+                    enabled = false,
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp)
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .heightIn(min = 260.dp)
+                ) {
+                    Card(
+                        modifier = Modifier.fillMaxSize(),
+                        shape = RoundedCornerShape(UiTokens.Radius),
+                        backgroundColor = md2CardContainerColor(),
+                        elevation = UiTokens.CardElevation
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(12.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth()
+                                    .verticalScroll(rememberScrollState())
+                            ) {
+                                AnimatedContent(
+                                    targetState = subtitleText,
+                                    transitionSpec = {
+                                        ContentTransform(
+                                            targetContentEnter = fadeIn(animationSpec = tween(180)) +
+                                                slideInVertically(
+                                                    initialOffsetY = { full -> full / 6 },
+                                                    animationSpec = tween(200, easing = FastOutSlowInEasing)
+                                                ),
+                                            initialContentExit = fadeOut(animationSpec = tween(120))
+                                        )
+                                    },
+                                    label = "quick_subtitle_text_change"
+                                ) { text ->
+                                    Text(
+                                        text = text,
+                                        style = MaterialTheme.typography.bodyLarge.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = subtitleSize.sp,
+                                            lineHeight = (subtitleSize * 1.15f).sp
+                                        )
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                MsIcon("search", contentDescription = "字体大小")
+                                Slider(
+                                    value = subtitleSize,
+                                    onValueChange = { viewModel.setQuickSubtitleFontSize(it) },
+                                    valueRange = 28f..96f,
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
                         }
                     }
-                    Spacer(Modifier.width(8.dp))
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
-            Md2StaggeredFloatIn(
-                index = 2,
-                enabled = false,
-                modifier = Modifier
-                    .padding(horizontal = 16.dp)
-                    .fillMaxWidth()
-            ) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(UiTokens.Radius),
-                    backgroundColor = md2CardContainerColor(),
-                    elevation = UiTokens.CardElevation
+            if (!isLandscape) {
+                AnimatedVisibility(
+                    visible = !quickInputCollapsed,
+                    enter = fadeIn(animationSpec = tween(140)) +
+                        expandVertically(animationSpec = tween(180, easing = FastOutSlowInEasing)),
+                    exit = fadeOut(animationSpec = tween(120)) +
+                        shrinkVertically(animationSpec = tween(160, easing = FastOutSlowInEasing))
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxHeight()
-                                .horizontalScroll(rememberScrollState()),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            groups.forEachIndexed { index, group ->
-                                val selected = selectedGroupIndex == index
-                                val tabBg = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
-                                Row(
-                                    modifier = Modifier
-                                        .height(48.dp)
-                                        .clip(RoundedCornerShape(UiTokens.Radius))
-                                        .background(tabBg)
-                                        .clickable { viewModel.selectQuickSubtitleGroup(index) }
-                                        .padding(horizontal = 10.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    MsIcon(group.icon, contentDescription = group.title)
-                                    Text(group.title, maxLines = 1)
+                    Column {
+                    Spacer(Modifier.height(8.dp))
+                    Md2StaggeredFloatIn(index = 1, enabled = false) {
+                        if (isLandscape) {
+                            Column(
+                                modifier = Modifier
+                                    .padding(horizontal = 16.dp)
+                                    .fillMaxWidth()
+                                    .heightIn(max = 220.dp)
+                                    .verticalScroll(rememberScrollState()),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                quickItems.forEach { text ->
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(72.dp)
+                                            .clickable {
+                                                viewModel.applyQuickSubtitleText(
+                                                    text = text,
+                                                    enqueueSpeak = hasVoice
+                                                )
+                                            },
+                                        shape = RoundedCornerShape(UiTokens.Radius),
+                                        backgroundColor = md2CardContainerColor(),
+                                        elevation = UiTokens.CardElevation
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Text(
+                                                text = text,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                                style = MaterialTheme.typography.bodyLarge
+                                            )
+                                        }
+                                    }
                                 }
-                                if (index != groups.lastIndex) {
-                                    Spacer(Modifier.width(2.dp))
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(56.dp)
+                                        .clickable {
+                                            viewModel.addQuickSubtitleItem(
+                                                groupIndex = selectedGroupIndex,
+                                                value = subtitleText
+                                            )
+                                        },
+                                    shape = RoundedCornerShape(UiTokens.Radius),
+                                    backgroundColor = md2CardContainerColor(),
+                                    elevation = UiTokens.CardElevation
+                                ) {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        MsIcon("add", contentDescription = "添加当前文本")
+                                    }
                                 }
                             }
+                        } else {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(100.dp)
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Keep frame edges flush; reserve shadow space inside scroll content.
+                                Spacer(Modifier.width(8.dp))
+                                quickItems.forEach { text ->
+                                    Card(
+                                        modifier = Modifier
+                                            .padding(vertical = 3.dp)
+                                            .width(148.dp)
+                                            .height(94.dp)
+                                            .clickable {
+                                                viewModel.applyQuickSubtitleText(
+                                                    text = text,
+                                                    enqueueSpeak = hasVoice
+                                                )
+                                            },
+                                        shape = RoundedCornerShape(UiTokens.Radius),
+                                        backgroundColor = md2CardContainerColor(),
+                                        elevation = UiTokens.CardElevation
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Text(
+                                                text = text,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                                style = MaterialTheme.typography.bodyLarge
+                                            )
+                                        }
+                                    }
+                                }
+                                Card(
+                                    modifier = Modifier
+                                        .padding(vertical = 3.dp)
+                                        .width(86.dp)
+                                        .height(94.dp)
+                                        .clickable {
+                                            viewModel.addQuickSubtitleItem(
+                                                groupIndex = selectedGroupIndex,
+                                                value = subtitleText
+                                            )
+                                        },
+                                    shape = RoundedCornerShape(UiTokens.Radius),
+                                    backgroundColor = md2CardContainerColor(),
+                                    elevation = UiTokens.CardElevation
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        MsIcon("add", contentDescription = "添加当前文本")
+                                    }
+                                }
+                                Spacer(Modifier.width(8.dp))
+                            }
                         }
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxHeight()
-                                .width(52.dp),
-                            color = MaterialTheme.colorScheme.primary
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Md2StaggeredFloatIn(
+                        index = 2,
+                        enabled = false,
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp)
+                            .fillMaxWidth()
+                    ) {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(UiTokens.Radius),
+                            backgroundColor = md2CardContainerColor(),
+                            elevation = UiTokens.CardElevation
                         ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                IconButton(onClick = onOpenEditor) {
-                                    MsIcon(
-                                        "edit",
-                                        contentDescription = "编辑快捷文本",
-                                        tint = MaterialTheme.colorScheme.onPrimary
-                                    )
+                            if (isLandscape) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 220.dp)
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxWidth()
+                                            .verticalScroll(rememberScrollState())
+                                            .padding(horizontal = 4.dp, vertical = 4.dp),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        groups.forEachIndexed { index, group ->
+                                            val selected = selectedGroupIndex == index
+                                            val tabBg = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(44.dp)
+                                                    .clip(RoundedCornerShape(UiTokens.Radius))
+                                                    .background(tabBg)
+                                                    .clickable { viewModel.selectQuickSubtitleGroup(index) }
+                                                    .padding(horizontal = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                MsIcon(group.icon, contentDescription = group.title)
+                                                Text(group.title, maxLines = 1)
+                                            }
+                                        }
+                                    }
+                                    Surface(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(44.dp),
+                                        color = MaterialTheme.colorScheme.primary
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            IconButton(onClick = onOpenEditor) {
+                                                MsIcon(
+                                                    "edit",
+                                                    contentDescription = "编辑快捷文本",
+                                                    tint = MaterialTheme.colorScheme.onPrimary
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxHeight()
+                                            .horizontalScroll(rememberScrollState()),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        groups.forEachIndexed { index, group ->
+                                            val selected = selectedGroupIndex == index
+                                            val tabBg = if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color.Transparent
+                                            Row(
+                                                modifier = Modifier
+                                                    .height(48.dp)
+                                                    .clip(RoundedCornerShape(UiTokens.Radius))
+                                                    .background(tabBg)
+                                                    .clickable { viewModel.selectQuickSubtitleGroup(index) }
+                                                    .padding(horizontal = 10.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                MsIcon(group.icon, contentDescription = group.title)
+                                                Text(group.title, maxLines = 1)
+                                            }
+                                            if (index != groups.lastIndex) {
+                                                Spacer(Modifier.width(2.dp))
+                                            }
+                                        }
+                                    }
+                                    Surface(
+                                        modifier = Modifier
+                                            .fillMaxHeight()
+                                            .width(52.dp),
+                                        color = MaterialTheme.colorScheme.primary
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            IconButton(onClick = onOpenEditor) {
+                                                MsIcon(
+                                                    "edit",
+                                                    contentDescription = "编辑快捷文本",
+                                                    tint = MaterialTheme.colorScheme.onPrimary
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                    }
                 }
             }
-            Spacer(Modifier.height(UiTokens.PageBottomBlank + 92.dp))
+            Spacer(Modifier.height(quickSubtitleBottomBlank))
         }
 
         Surface(
@@ -3743,6 +4180,59 @@ fun QuickSubtitleScreen(
             color = md2CardContainerColor(),
             elevation = UiTokens.CardElevation
         ) {
+            val sendInput = {
+                if (inputFieldValue.text.trim().isNotEmpty()) {
+                    viewModel.submitQuickSubtitleInput(
+                        playVoice = playOnSend && hasVoice
+                    )
+                    inputFieldValue = TextFieldValue("")
+                }
+            }
+            val actionButtons: @Composable () -> Unit = {
+                Md2IconButton(
+                    icon = "arrow_back",
+                    contentDescription = "光标左移",
+                    onClick = {
+                        val current = inputFieldValue.selection.start.coerceIn(0, inputFieldValue.text.length)
+                        val target = (current - 1).coerceAtLeast(0)
+                        inputFieldValue = inputFieldValue.copy(selection = TextRange(target))
+                    }
+                )
+                Md2IconButton(
+                    icon = "arrow_forward",
+                    contentDescription = "光标右移",
+                    onClick = {
+                        val current = inputFieldValue.selection.end.coerceIn(0, inputFieldValue.text.length)
+                        val target = (current + 1).coerceAtMost(inputFieldValue.text.length)
+                        inputFieldValue = inputFieldValue.copy(selection = TextRange(target))
+                    }
+                )
+                Md2IconButton(
+                    icon = if (playOnSend) "volume_up" else "volume_off",
+                    contentDescription = if (playOnSend) "发送时播放语音：开" else "发送时播放语音：关",
+                    onClick = {
+                        viewModel.updateQuickSubtitlePlayOnSend(!playOnSend)
+                    }
+                )
+                Md2IconButton(
+                    icon = if (isLandscape) {
+                        if (quickInputCollapsed) "chevron_left" else "chevron_right"
+                    } else {
+                        if (quickInputCollapsed) "unfold_more" else "unfold_less"
+                    },
+                    contentDescription = if (quickInputCollapsed) "展开快捷输入区域" else "收起快捷输入区域",
+                    onClick = {
+                        quickInputCollapsed = !quickInputCollapsed
+                    }
+                )
+                Md2IconButton(
+                    icon = "play_arrow",
+                    contentDescription = "朗读当前字幕",
+                    onClick = {
+                        viewModel.applyQuickSubtitleText(subtitleText, enqueueSpeak = hasVoice)
+                    }
+                )
+            }
             Column(
                 modifier = Modifier
                     .navigationBarsPadding()
@@ -3754,130 +4244,175 @@ fun QuickSubtitleScreen(
                     ),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Md2IconButton(
-                        icon = "arrow_back",
-                        contentDescription = "光标左移",
-                        onClick = {
-                            val current = inputFieldValue.selection.start.coerceIn(0, inputFieldValue.text.length)
-                            val target = (current - 1).coerceAtLeast(0)
-                            inputFieldValue = inputFieldValue.copy(selection = TextRange(target))
+                if (isLandscape) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            actionButtons()
                         }
-                    )
-                    Md2IconButton(
-                        icon = "arrow_forward",
-                        contentDescription = "光标右移",
-                        onClick = {
-                            val current = inputFieldValue.selection.end.coerceIn(0, inputFieldValue.text.length)
-                            val target = (current + 1).coerceAtMost(inputFieldValue.text.length)
-                            inputFieldValue = inputFieldValue.copy(selection = TextRange(target))
-                        }
-                    )
-                    Md2IconButton(
-                        icon = if (playOnSend) "volume_up" else "volume_off",
-                        contentDescription = if (playOnSend) "发送时播放语音：开" else "发送时播放语音：关",
-                        onClick = {
-                            viewModel.updateQuickSubtitlePlayOnSend(!playOnSend)
-                        }
-                    )
-                    Md2IconButton(
-                        icon = "play_arrow",
-                        contentDescription = "朗读当前字幕",
-                        onClick = {
-                            viewModel.applyQuickSubtitleText(subtitleText, enqueueSpeak = hasVoice)
-                        }
-                    )
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    val sendInput = {
-                        if (inputFieldValue.text.trim().isNotEmpty()) {
-                            viewModel.submitQuickSubtitleInput(
-                                playVoice = playOnSend && hasVoice
+                        OutlinedTextField(
+                            value = inputFieldValue,
+                            onValueChange = {
+                                inputFieldValue = it
+                                viewModel.updateQuickSubtitleInputText(it.text)
+                            },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            placeholder = { Text("请输入文本") },
+                            keyboardOptions = KeyboardOptions(
+                                capitalization = KeyboardCapitalization.Sentences,
+                                autoCorrect = true,
+                                keyboardType = KeyboardType.Text,
+                                imeAction = ImeAction.Send
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onSend = { sendInput() },
+                                onDone = { sendInput() }
+                            ),
+                            trailingIcon = {
+                                if (inputFieldValue.text.isNotEmpty()) {
+                                    IconButton(
+                                        onClick = {
+                                            inputFieldValue = TextFieldValue("")
+                                            viewModel.updateQuickSubtitleInputText("")
+                                        }
+                                    ) {
+                                        MsIcon("close", contentDescription = "清空输入")
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(UiTokens.Radius),
+                            colors = TextFieldDefaults.outlinedTextFieldColors(
+                                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                                focusedLabelColor = MaterialTheme.colorScheme.primary,
+                                unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                cursorColor = MaterialTheme.colorScheme.primary
                             )
-                            inputFieldValue = TextFieldValue("")
+                        )
+                        FloatingActionButton(
+                            onClick = onToggleMic,
+                            modifier = Modifier.size(48.dp),
+                            backgroundColor = MaterialTheme.colorScheme.primary,
+                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                            shape = CircleShape,
+                            elevation = FloatingActionButtonDefaults.elevation(
+                                defaultElevation = UiTokens.FabElevation,
+                                pressedElevation = 12.dp
+                            )
+                        ) {
+                            MsIcon(
+                                name = if (state.running) "stop" else "play_arrow",
+                                contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
+                                tint = MaterialTheme.colorScheme.onPrimary
+                            )
+                        }
+                        IconButton(
+                            onClick = sendInput,
+                            enabled = inputFieldValue.text.trim().isNotEmpty()
+                        ) {
+                            MsIcon(
+                                name = "send",
+                                contentDescription = "发送到朗读队列",
+                                tint = if (inputFieldValue.text.trim().isNotEmpty()) LocalContentColor.current else LocalContentColor.current.copy(alpha = 0.38f)
+                            )
                         }
                     }
-                    OutlinedTextField(
-                        value = inputFieldValue,
-                        onValueChange = {
-                            inputFieldValue = it
-                            viewModel.updateQuickSubtitleInputText(it.text)
-                        },
-                        modifier = Modifier.weight(1f),
-                        singleLine = true,
-                        placeholder = { Text("请输入文本") },
-                        keyboardOptions = KeyboardOptions(
-                            capitalization = KeyboardCapitalization.Sentences,
-                            autoCorrect = true,
-                            keyboardType = KeyboardType.Text,
-                            imeAction = ImeAction.Send
-                        ),
-                        keyboardActions = KeyboardActions(
-                            onSend = { sendInput() },
-                            onDone = { sendInput() }
-                        ),
-                        trailingIcon = {
-                            if (inputFieldValue.text.isNotEmpty()) {
-                                IconButton(
-                                    onClick = {
-                                        inputFieldValue = TextFieldValue("")
-                                        viewModel.updateQuickSubtitleInputText("")
-                                    }
-                                ) {
-                                    MsIcon("close", contentDescription = "清空输入")
-                                }
-                            }
-                        },
-                        shape = RoundedCornerShape(UiTokens.Radius),
-                        colors = TextFieldDefaults.outlinedTextFieldColors(
-                            focusedBorderColor = MaterialTheme.colorScheme.primary,
-                            unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                            focusedLabelColor = MaterialTheme.colorScheme.primary,
-                            unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                            cursorColor = MaterialTheme.colorScheme.primary
-                        )
-                    )
-                    IconButton(
-                        onClick = sendInput,
-                        enabled = inputFieldValue.text.trim().isNotEmpty()
+                } else {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        MsIcon(
-                            name = "send",
-                            contentDescription = "发送到朗读队列",
-                            tint = if (inputFieldValue.text.trim().isNotEmpty()) LocalContentColor.current else LocalContentColor.current.copy(alpha = 0.38f)
+                        actionButtons()
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = inputFieldValue,
+                            onValueChange = {
+                                inputFieldValue = it
+                                viewModel.updateQuickSubtitleInputText(it.text)
+                            },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true,
+                            placeholder = { Text("请输入文本") },
+                            keyboardOptions = KeyboardOptions(
+                                capitalization = KeyboardCapitalization.Sentences,
+                                autoCorrect = true,
+                                keyboardType = KeyboardType.Text,
+                                imeAction = ImeAction.Send
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onSend = { sendInput() },
+                                onDone = { sendInput() }
+                            ),
+                            trailingIcon = {
+                                if (inputFieldValue.text.isNotEmpty()) {
+                                    IconButton(
+                                        onClick = {
+                                            inputFieldValue = TextFieldValue("")
+                                            viewModel.updateQuickSubtitleInputText("")
+                                        }
+                                    ) {
+                                        MsIcon("close", contentDescription = "清空输入")
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(UiTokens.Radius),
+                            colors = TextFieldDefaults.outlinedTextFieldColors(
+                                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+                                focusedLabelColor = MaterialTheme.colorScheme.primary,
+                                unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                cursorColor = MaterialTheme.colorScheme.primary
+                            )
                         )
+                        IconButton(
+                            onClick = sendInput,
+                            enabled = inputFieldValue.text.trim().isNotEmpty()
+                        ) {
+                            MsIcon(
+                                name = "send",
+                                contentDescription = "发送到朗读队列",
+                                tint = if (inputFieldValue.text.trim().isNotEmpty()) LocalContentColor.current else LocalContentColor.current.copy(alpha = 0.38f)
+                            )
+                        }
                     }
                 }
             }
         }
 
-        FloatingActionButton(
-            onClick = onToggleMic,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .imePadding()
-                .navigationBarsPadding()
-                .padding(end = 20.dp, bottom = 80.dp),
-            backgroundColor = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary,
-            shape = CircleShape,
-            elevation = FloatingActionButtonDefaults.elevation(
-                defaultElevation = UiTokens.FabElevation,
-                pressedElevation = 12.dp
-            )
-        ) {
-            MsIcon(
-                name = if (state.running) "stop" else "play_arrow",
-                contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
-                tint = MaterialTheme.colorScheme.onPrimary
-            )
+        if (!isLandscape) {
+            FloatingActionButton(
+                onClick = onToggleMic,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .imePadding()
+                    .navigationBarsPadding()
+                    .padding(end = 20.dp, bottom = 80.dp),
+                backgroundColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+                shape = CircleShape,
+                elevation = FloatingActionButtonDefaults.elevation(
+                    defaultElevation = UiTokens.FabElevation,
+                    pressedElevation = 12.dp
+                )
+            ) {
+                MsIcon(
+                    name = if (state.running) "stop" else "play_arrow",
+                    contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
+                    tint = MaterialTheme.colorScheme.onPrimary
+                )
+            }
         }
     }
 }
@@ -5441,11 +5976,15 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
     var drawerModeExpanded by remember { mutableStateOf(false) }
     var inputTypeExpanded by remember { mutableStateOf(false) }
     var outputTypeExpanded by remember { mutableStateOf(false) }
-    var drawingSavePathText by remember(state.drawingSaveRelativePath) {
-        mutableStateOf(state.drawingSaveRelativePath)
-    }
     val asrPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) viewModel.importAsr(uri) else toast(context, "未选择文件")
+    }
+    val drawingDirPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            viewModel.setDrawingSavePathFromTreeUri(uri)
+        } else {
+            toast(context, "未选择目录")
+        }
     }
     Column(
         modifier = Modifier
@@ -5518,50 +6057,24 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
                 Text("开启后顶栏与状态栏颜色改为卡片同款自适应配色。", style = MaterialTheme.typography.bodySmall)
 
                 Text("画板保存路径（相册）", fontWeight = FontWeight.Bold)
-                OutlinedTextField(
-                    value = drawingSavePathText,
-                    onValueChange = { drawingSavePathText = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    placeholder = { Text(UserPrefs.DEFAULT_DRAWING_SAVE_RELATIVE_PATH) },
-                    keyboardOptions = KeyboardOptions(
-                        capitalization = KeyboardCapitalization.None,
-                        autoCorrect = false,
-                        keyboardType = KeyboardType.Text,
-                        imeAction = ImeAction.Done
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onDone = {
-                            viewModel.setDrawingSaveRelativePath(drawingSavePathText)
-                        }
-                    ),
-                    shape = RoundedCornerShape(UiTokens.Radius),
-                    colors = TextFieldDefaults.outlinedTextFieldColors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
-                        focusedLabelColor = MaterialTheme.colorScheme.primary,
-                        unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        cursorColor = MaterialTheme.colorScheme.primary
-                    )
-                )
+                Text(state.drawingSaveRelativePath, style = MaterialTheme.typography.bodySmall)
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Md2OutlinedButton(onClick = {
-                        viewModel.setDrawingSaveRelativePath(drawingSavePathText)
+                        drawingDirPicker.launch(null)
                     }) {
-                        Text("应用路径")
+                        Text("选择目录")
                     }
                     Md2TextButton(onClick = {
                         val def = UserPrefs.DEFAULT_DRAWING_SAVE_RELATIVE_PATH
-                        drawingSavePathText = def
                         viewModel.setDrawingSaveRelativePath(def)
                     }) {
                         Text("恢复默认")
                     }
                 }
-                Text("示例：Pictures/KGTTS/Drawings", style = MaterialTheme.typography.bodySmall)
+                Text("通过系统文件管理器选择目录（建议内部存储）", style = MaterialTheme.typography.bodySmall)
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
