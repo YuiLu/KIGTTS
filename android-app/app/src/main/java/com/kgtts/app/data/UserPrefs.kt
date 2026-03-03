@@ -34,6 +34,7 @@ object UserPrefs {
     private val KEY_LANDSCAPE_DRAWER_MODE = intPreferencesKey("landscape_drawer_mode")
     private val KEY_SOLID_TOP_BAR = booleanPreferencesKey("solid_top_bar")
     private val KEY_DRAWING_SAVE_RELATIVE_PATH = stringPreferencesKey("drawing_save_relative_path")
+    private val KEY_ASR_SEND_TO_QUICK_SUBTITLE = booleanPreferencesKey("asr_send_to_quick_subtitle")
     private val KEY_QUICK_SUBTITLE_CONFIG = stringPreferencesKey("quick_subtitle_config")
 
     data class AppSettings(
@@ -51,6 +52,7 @@ object UserPrefs {
         val landscapeDrawerMode: Int = DRAWER_MODE_PERMANENT,
         val solidTopBar: Boolean = true,
         val drawingSaveRelativePath: String = DEFAULT_DRAWING_SAVE_RELATIVE_PATH,
+        val asrSendToQuickSubtitle: Boolean = true,
         val allowSystemAecWithAec3: Boolean = true
     )
 
@@ -88,6 +90,7 @@ object UserPrefs {
             solidTopBar = prefs[KEY_SOLID_TOP_BAR] ?: true,
             drawingSaveRelativePath = (prefs[KEY_DRAWING_SAVE_RELATIVE_PATH]
                 ?: DEFAULT_DRAWING_SAVE_RELATIVE_PATH).ifBlank { DEFAULT_DRAWING_SAVE_RELATIVE_PATH },
+            asrSendToQuickSubtitle = prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] ?: true,
             allowSystemAecWithAec3 = true
         )
     }
@@ -181,6 +184,12 @@ object UserPrefs {
         context.dataStore.edit { prefs ->
             prefs[KEY_DRAWING_SAVE_RELATIVE_PATH] =
                 path.ifBlank { DEFAULT_DRAWING_SAVE_RELATIVE_PATH }
+        }
+    }
+
+    suspend fun setAsrSendToQuickSubtitle(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] = enabled
         }
     }
 

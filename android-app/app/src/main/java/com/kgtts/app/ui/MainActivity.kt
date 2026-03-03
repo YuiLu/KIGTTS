@@ -257,6 +257,7 @@ data class UiState(
     val landscapeDrawerMode: Int = UserPrefs.DRAWER_MODE_PERMANENT,
     val solidTopBar: Boolean = true,
     val drawingSaveRelativePath: String = UserPrefs.DEFAULT_DRAWING_SAVE_RELATIVE_PATH,
+    val asrSendToQuickSubtitle: Boolean = true,
     val inputLevel: Float = 0f,
     val inputDeviceLabel: String = "未知",
     val outputDeviceLabel: String = "未知"
@@ -627,6 +628,12 @@ class MainViewModel(
                 realtimeRecognized = next
                 val validIds = next.asSequence().map { it.id }.toSet()
                 lastProgressUpdateAtMs.keys.retainAll(validIds)
+                if (uiState.asrSendToQuickSubtitle) {
+                    val normalized = text.trim()
+                    if (normalized.isNotEmpty() && normalized != quickSubtitleCurrentText) {
+                        quickSubtitleCurrentText = normalized
+                    }
+                }
             },
             onProgress = { id, progress ->
                 val items = realtimeRecognized
@@ -761,7 +768,8 @@ class MainViewModel(
                 numberReplaceMode = settings.numberReplaceMode,
                 landscapeDrawerMode = settings.landscapeDrawerMode,
                 solidTopBar = settings.solidTopBar,
-                drawingSaveRelativePath = normalizeDrawingSaveRelativePath(settings.drawingSaveRelativePath)
+                drawingSaveRelativePath = normalizeDrawingSaveRelativePath(settings.drawingSaveRelativePath),
+                asrSendToQuickSubtitle = settings.asrSendToQuickSubtitle
             )
             applySettingsToController(settings)
         }
@@ -951,6 +959,13 @@ class MainViewModel(
         controller?.setNumberReplaceMode(clamped)
         viewModelScope.launch {
             UserPrefs.setNumberReplaceMode(appContext, clamped)
+        }
+    }
+
+    fun setAsrSendToQuickSubtitle(enabled: Boolean) {
+        uiState = uiState.copy(asrSendToQuickSubtitle = enabled)
+        viewModelScope.launch {
+            UserPrefs.setAsrSendToQuickSubtitle(appContext, enabled)
         }
     }
 
@@ -3570,7 +3585,7 @@ fun QuickSubtitleScreen(
     val landscapeQuickPanelWidth = 220.dp
     val landscapeQuickPanelGap = 8.dp
     val quickSubtitleBottomBlank = if (isLandscape) {
-        UiTokens.PageBottomBlank + 12.dp
+        UiTokens.PageBottomBlank + 6.dp
     } else {
         UiTokens.PageBottomBlank + 92.dp
     }
@@ -3670,21 +3685,20 @@ fun QuickSubtitleScreen(
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     MsIcon("search", contentDescription = "字体大小")
-                                    BoxWithConstraints(
+                                    Box(
                                         modifier = Modifier
                                             .padding(top = 8.dp, bottom = 4.dp)
                                             .weight(1f)
                                             .fillMaxWidth(),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Slider(
+                                        Md2VerticalSlider(
                                             value = subtitleSize,
                                             onValueChange = { viewModel.setQuickSubtitleFontSize(it) },
                                             valueRange = 28f..96f,
                                             modifier = Modifier
-                                                .height(28.dp)
-                                                .width(maxHeight)
-                                                .graphicsLayer { rotationZ = -90f }
+                                                .fillMaxHeight()
+                                                .width(28.dp)
                                         )
                                     }
                                 }
@@ -6092,6 +6106,17 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
 
         Md2StaggeredFloatIn(index = 3) {
             Md2SettingsCard(title = "识别与转换") {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Md2Switch(
+                    checked = state.asrSendToQuickSubtitle,
+                    onCheckedChange = { viewModel.setAsrSendToQuickSubtitle(it) }
+                )
+                Text("识别结果自动上屏大字幕")
+            }
+            Text("开启后：语音识别结果会自动更新便捷字幕主文本", style = MaterialTheme.typography.bodySmall)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
