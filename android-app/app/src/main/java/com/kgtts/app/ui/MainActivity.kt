@@ -144,6 +144,7 @@ import com.canhub.cropper.CropImageOptions
 import com.canhub.cropper.CropImageView
 import com.kgtts.app.audio.AudioRoutePreference
 import com.kgtts.app.audio.RealtimeController
+import com.kgtts.app.audio.SpeakerEnrollResult
 import com.kgtts.app.data.ModelRepository
 import com.kgtts.app.data.VoicePackInfo
 import com.kgtts.app.data.UserPrefs
@@ -263,6 +264,10 @@ data class UiState(
     val solidTopBar: Boolean = true,
     val drawingSaveRelativePath: String = UserPrefs.DEFAULT_DRAWING_SAVE_RELATIVE_PATH,
     val asrSendToQuickSubtitle: Boolean = true,
+    val speakerVerifyEnabled: Boolean = false,
+    val speakerVerifyThreshold: Float = 0.72f,
+    val speakerProfileReady: Boolean = false,
+    val speakerLastSimilarity: Float = -1f,
     val inputLevel: Float = 0f,
     val inputDeviceLabel: String = "未知",
     val outputDeviceLabel: String = "未知"
@@ -350,6 +355,7 @@ class MainViewModel(
     private var restartJob: Job? = null
     private val lastProgressUpdateAtMs = mutableMapOf<Long, Long>()
     private var lastLevelUpdateAtMs = 0L
+    private var speakerProfileVector: FloatArray? = null
 
     private companion object {
         private const val LEVEL_UPDATE_INTERVAL_MS = 33L
@@ -699,6 +705,15 @@ class MainViewModel(
                     uiState = uiState.copy(aec3Diag = diag)
                 }
             },
+            onSpeakerVerify = { similarity, passed ->
+                uiState = uiState.copy(speakerLastSimilarity = similarity)
+                if (!passed && uiState.speakerVerifyEnabled) {
+                    val msg = "说话人验证未通过(${String.format("%.2f", similarity)})"
+                    if (uiState.status != msg) {
+                        uiState = uiState.copy(status = msg)
+                    }
+                }
+            },
             onError = { msg -> uiState = uiState.copy(status = msg, running = false) },
             initialSuppressWhilePlaying = uiState.muteWhilePlaying,
             initialUseVoiceCommunication = uiState.echoSuppression,
@@ -710,7 +725,10 @@ class MainViewModel(
             initialPreferredOutputType = uiState.preferredOutputType,
             initialUseAec3 = uiState.aec3Enabled,
             initialNumberReplaceMode = uiState.numberReplaceMode,
-            initialAllowSystemAecWithAec3 = true
+            initialAllowSystemAecWithAec3 = true,
+            initialSpeakerVerifyEnabled = uiState.speakerVerifyEnabled,
+            initialSpeakerVerifyThreshold = uiState.speakerVerifyThreshold,
+            initialSpeakerProfile = speakerProfileVector
         )
         controller = created
         return created
@@ -765,6 +783,7 @@ class MainViewModel(
     fun loadSettings() {
         viewModelScope.launch {
             val settings = UserPrefs.getSettings(appContext)
+            speakerProfileVector = UserPrefs.parseSpeakerVerifyProfile(settings.speakerVerifyProfileCsv)
             uiState = uiState.copy(
                 muteWhilePlaying = settings.muteWhilePlaying,
                 muteWhilePlayingDelaySec = settings.muteWhilePlayingDelaySec,
@@ -782,7 +801,11 @@ class MainViewModel(
                 landscapeDrawerMode = settings.landscapeDrawerMode,
                 solidTopBar = settings.solidTopBar,
                 drawingSaveRelativePath = normalizeDrawingSaveRelativePath(settings.drawingSaveRelativePath),
-                asrSendToQuickSubtitle = settings.asrSendToQuickSubtitle
+                asrSendToQuickSubtitle = settings.asrSendToQuickSubtitle,
+                speakerVerifyEnabled = settings.speakerVerifyEnabled,
+                speakerVerifyThreshold = settings.speakerVerifyThreshold,
+                speakerProfileReady = speakerProfileVector != null,
+                speakerLastSimilarity = -1f
             )
             applySettingsToController(settings)
         }
@@ -979,6 +1002,93 @@ class MainViewModel(
         uiState = uiState.copy(asrSendToQuickSubtitle = enabled)
         viewModelScope.launch {
             UserPrefs.setAsrSendToQuickSubtitle(appContext, enabled)
+        }
+    }
+
+    fun setSpeakerVerifyEnabled(enabled: Boolean) {
+        uiState = uiState.copy(speakerVerifyEnabled = enabled)
+        controller?.setSpeakerVerifyEnabled(enabled)
+        viewModelScope.launch {
+            UserPrefs.setSpeakerVerifyEnabled(appContext, enabled)
+        }
+        if (enabled && speakerProfileVector == null) {
+            uiState = uiState.copy(status = "说话人验证已开启，请先注册说话人")
+        }
+    }
+
+    fun setSpeakerVerifyThreshold(threshold: Float) {
+        val clamped = threshold.coerceIn(0.4f, 0.95f)
+        uiState = uiState.copy(speakerVerifyThreshold = clamped)
+        controller?.setSpeakerVerifyThreshold(clamped)
+        viewModelScope.launch {
+            UserPrefs.setSpeakerVerifyThreshold(appContext, clamped)
+        }
+    }
+
+    fun clearSpeakerProfile() {
+        speakerProfileVector = null
+        uiState = uiState.copy(
+            speakerVerifyEnabled = false,
+            speakerProfileReady = false,
+            speakerLastSimilarity = -1f,
+            status = "已清除说话人注册信息"
+        )
+        controller?.setSpeakerVerifyEnabled(false)
+        controller?.clearSpeakerProfile()
+        viewModelScope.launch {
+            UserPrefs.setSpeakerVerifyEnabled(appContext, false)
+            UserPrefs.setSpeakerVerifyProfile(appContext, null)
+        }
+    }
+
+    fun applySpeakerProfile(profile: FloatArray) {
+        speakerProfileVector = profile.copyOf()
+        controller?.setSpeakerProfile(profile)
+        uiState = uiState.copy(
+            speakerProfileReady = true,
+            speakerLastSimilarity = 1f,
+            status = "说话人注册成功"
+        )
+        viewModelScope.launch {
+            UserPrefs.setSpeakerVerifyProfile(appContext, profile)
+        }
+    }
+
+    suspend fun enrollSpeakerProfileNow(
+        durationSec: Float = 4f,
+        onCapture: ((progress: Float, level: Float) -> Unit)? = null,
+        persist: Boolean = true
+    ): SpeakerEnrollResult {
+        if (uiState.running) {
+            val msg = "请先停止麦克风再注册说话人"
+            uiState = uiState.copy(status = msg)
+            return SpeakerEnrollResult(success = false, message = msg)
+        }
+        val activeController = ensureController()
+        uiState = uiState.copy(status = "说话人注册中（请持续说话约${durationSec.toInt()}秒）...")
+        val result = withContext(Dispatchers.IO) {
+            activeController.enrollSpeaker(durationSec) { progress, level ->
+                if (onCapture != null) {
+                    viewModelScope.launch(Dispatchers.Main) {
+                        onCapture(progress, level)
+                    }
+                }
+            }
+        }
+        if (result.success && result.profile != null) {
+            if (persist) {
+                applySpeakerProfile(result.profile)
+                uiState = uiState.copy(status = result.message)
+            }
+        } else {
+            uiState = uiState.copy(status = result.message)
+        }
+        return result
+    }
+
+    fun enrollSpeakerProfile() {
+        viewModelScope.launch {
+            enrollSpeakerProfileNow(4f)
         }
     }
 
@@ -1344,6 +1454,9 @@ class MainViewModel(
         controller?.setPreferredOutputType(settings.preferredOutputType)
         controller?.setNumberReplaceMode(settings.numberReplaceMode)
         controller?.setAllowSystemAecWithAec3(true)
+        controller?.setSpeakerVerifyEnabled(settings.speakerVerifyEnabled)
+        controller?.setSpeakerVerifyThreshold(settings.speakerVerifyThreshold)
+        controller?.setSpeakerProfile(speakerProfileVector)
     }
 }
 
@@ -6190,6 +6303,7 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawStrokeOnBoard(
 @Composable
 fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val scroll = rememberScrollState()
     val drawerModeOptions = listOf(
         UserPrefs.DRAWER_MODE_HIDDEN to "隐藏式抽屉",
@@ -6213,6 +6327,26 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
     var drawerModeExpanded by remember { mutableStateOf(false) }
     var inputTypeExpanded by remember { mutableStateOf(false) }
     var outputTypeExpanded by remember { mutableStateOf(false) }
+    var showSpeakerEnrollDialog by remember { mutableStateOf(false) }
+    var speakerEnrollStep by remember { mutableIntStateOf(0) } // 0准备 1句1 2句2 3句3 4结果
+    var speakerEnrollCountingDown by remember { mutableStateOf(false) }
+    var speakerEnrollCountdown by remember { mutableIntStateOf(3) }
+    var speakerEnrollReading by remember { mutableStateOf(false) }
+    var speakerEnrollRemainingSec by remember { mutableFloatStateOf(4f) }
+    var speakerEnrollProgress by remember { mutableFloatStateOf(0f) }
+    var speakerEnrollLevel by remember { mutableFloatStateOf(0f) }
+    var speakerEnrollSuccess by remember { mutableStateOf(false) }
+    var speakerEnrollMessage by remember { mutableStateOf("") }
+    var speakerEnrollRetryDialog by remember { mutableStateOf(false) }
+    var speakerEnrollOpenedByToggle by remember { mutableStateOf(false) }
+    val speakerEnrollTexts = remember {
+        listOf(
+            "清晨的风吹过脸颊，我大步沿着河边走。",
+            "远处钟声敲响，心跳也慢慢静下来。",
+            "水面浮着天光，闭上眼，听见自己的呼吸。"
+        )
+    }
+    val speakerEnrollSamples = remember { mutableStateListOf<FloatArray?>() }
     val asrPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) viewModel.importAsr(uri) else toast(context, "未选择文件")
     }
@@ -6222,6 +6356,101 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
         } else {
             toast(context, "未选择目录")
         }
+    }
+    fun combineSpeakerProfiles(samples: List<FloatArray>): FloatArray? {
+        if (samples.isEmpty()) return null
+        val dim = samples.minOfOrNull { it.size } ?: return null
+        if (dim <= 0) return null
+        val out = FloatArray(dim)
+        samples.forEach { s ->
+            for (i in 0 until dim) {
+                out[i] += s[i]
+            }
+        }
+        for (i in out.indices) {
+            out[i] /= samples.size.toFloat()
+        }
+        var sumSq = 0.0
+        for (v in out) sumSq += v * v
+        val norm = kotlin.math.sqrt(sumSq)
+        if (norm <= 1e-8) return null
+        for (i in out.indices) {
+            out[i] = (out[i] / norm).toFloat()
+        }
+        return out
+    }
+    fun startSpeakerEnrollStepCapture(step: Int) {
+        if (speakerEnrollReading || speakerEnrollCountingDown) return
+        if (step !in 1..3) return
+        scope.launch {
+            speakerEnrollCountingDown = true
+            speakerEnrollCountdown = 3
+            speakerEnrollMessage = "请准备，第 $step 句即将开始"
+            for (i in 3 downTo 1) {
+                speakerEnrollCountdown = i
+                delay(800)
+                if (!showSpeakerEnrollDialog) {
+                    speakerEnrollCountingDown = false
+                    return@launch
+                }
+            }
+            speakerEnrollCountingDown = false
+            speakerEnrollReading = true
+            speakerEnrollProgress = 0f
+            speakerEnrollLevel = 0f
+            speakerEnrollRemainingSec = 4f
+            speakerEnrollMessage = "请朗读第 $step 句"
+            val result = viewModel.enrollSpeakerProfileNow(
+                durationSec = 4f,
+                onCapture = { progress, level ->
+                    speakerEnrollProgress = progress.coerceIn(0f, 1f)
+                    speakerEnrollLevel = level.coerceIn(0f, 1f)
+                    speakerEnrollRemainingSec = (4f * (1f - speakerEnrollProgress)).coerceAtLeast(0f)
+                },
+                persist = false
+            )
+            speakerEnrollReading = false
+            speakerEnrollLevel = 0f
+            if (result.success && result.profile != null) {
+                val index = step - 1
+                while (speakerEnrollSamples.size <= index) {
+                    speakerEnrollSamples.add(null)
+                }
+                speakerEnrollSamples[index] = result.profile
+                if (step < 3) {
+                    speakerEnrollStep = step + 1
+                    speakerEnrollProgress = 0f
+                    speakerEnrollRemainingSec = 4f
+                    speakerEnrollMessage = "第 $step 句录制成功"
+                } else {
+                    val combined = combineSpeakerProfiles(speakerEnrollSamples.filterNotNull())
+                    if (combined == null) {
+                        speakerEnrollRetryDialog = true
+                        speakerEnrollMessage = "合并注册信息失败，请重录第三句"
+                    } else {
+                        viewModel.applySpeakerProfile(combined)
+                        speakerEnrollSuccess = true
+                        speakerEnrollStep = 4
+                        speakerEnrollProgress = 1f
+                        speakerEnrollMessage = "说话人注册成功"
+                    }
+                }
+            } else {
+                speakerEnrollSuccess = false
+                speakerEnrollRetryDialog = true
+                speakerEnrollMessage = result.message
+            }
+        }
+    }
+    fun closeSpeakerEnrollDialog() {
+        showSpeakerEnrollDialog = false
+        speakerEnrollCountingDown = false
+        speakerEnrollReading = false
+        val hasRegistered = state.speakerProfileReady || speakerEnrollSuccess
+        if (speakerEnrollOpenedByToggle && !hasRegistered) {
+            viewModel.setSpeakerVerifyEnabled(false)
+        }
+        speakerEnrollOpenedByToggle = false
     }
     Column(
         modifier = Modifier
@@ -6340,6 +6569,81 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
                 Text("识别结果自动上屏大字幕")
             }
             Text("开启后：语音识别结果会自动更新便捷字幕主文本", style = MaterialTheme.typography.bodySmall)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Md2Switch(
+                    checked = state.speakerVerifyEnabled,
+                    onCheckedChange = { enabled ->
+                        if (!enabled) {
+                            viewModel.setSpeakerVerifyEnabled(false)
+                        } else if (state.speakerProfileReady) {
+                            viewModel.setSpeakerVerifyEnabled(true)
+                        } else {
+                            viewModel.setSpeakerVerifyEnabled(true)
+                            speakerEnrollSamples.clear()
+                            speakerEnrollStep = 0
+                            speakerEnrollCountingDown = false
+                            speakerEnrollCountdown = 3
+                            speakerEnrollReading = false
+                            speakerEnrollProgress = 0f
+                            speakerEnrollLevel = 0f
+                            speakerEnrollRemainingSec = 4f
+                            speakerEnrollSuccess = false
+                            speakerEnrollMessage = "请按页面引导完成注册。"
+                            speakerEnrollRetryDialog = false
+                            speakerEnrollOpenedByToggle = true
+                            showSpeakerEnrollDialog = true
+                        }
+                    }
+                )
+                Text("说话人验证")
+            }
+            Text(
+                "说话人注册：${if (state.speakerProfileReady) "已注册" else "未注册"}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                "验证阈值：${String.format("%.2f", state.speakerVerifyThreshold)}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Slider(
+                value = state.speakerVerifyThreshold,
+                onValueChange = { viewModel.setSpeakerVerifyThreshold(it) },
+                valueRange = 0.4f..0.95f
+            )
+            if (state.speakerLastSimilarity >= 0f) {
+                Text(
+                    "最近相似度：${String.format("%.2f", state.speakerLastSimilarity)}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Md2OutlinedButton(onClick = {
+                    speakerEnrollSamples.clear()
+                    speakerEnrollStep = 0
+                    speakerEnrollCountingDown = false
+                    speakerEnrollCountdown = 3
+                    speakerEnrollReading = false
+                    speakerEnrollProgress = 0f
+                    speakerEnrollLevel = 0f
+                    speakerEnrollRemainingSec = 4f
+                    speakerEnrollSuccess = false
+                    speakerEnrollMessage = "请按页面引导完成注册。"
+                    speakerEnrollRetryDialog = false
+                    speakerEnrollOpenedByToggle = false
+                    showSpeakerEnrollDialog = true
+                }) {
+                    Text("注册说话人")
+                }
+                Md2TextButton(onClick = { viewModel.clearSpeakerProfile() }) {
+                    Text("清除注册")
+                }
+            }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -6489,6 +6793,159 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
         }
 
         Spacer(Modifier.height(UiTokens.PageBottomBlank))
+    }
+
+    if (showSpeakerEnrollDialog) {
+        val canDismiss = !(speakerEnrollReading || speakerEnrollCountingDown)
+        AlertDialog(
+            onDismissRequest = {
+                if (canDismiss) {
+                    closeSpeakerEnrollDialog()
+                }
+            },
+            title = {
+                val title = when (speakerEnrollStep) {
+                    0 -> "说话人注册（准备）"
+                    1, 2, 3 -> "说话人注册（第 ${speakerEnrollStep} 句）"
+                    else -> "说话人注册（结果）"
+                }
+                Text(title)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    when (speakerEnrollStep) {
+                        0 -> {
+                            Text("请按顺序朗读三句，每句约 4 秒。")
+                            Text("环境尽量安静，手机靠近说话人。", style = MaterialTheme.typography.bodySmall)
+                            Text("第一页仅说明，点击“下一步”开始。", style = MaterialTheme.typography.bodySmall)
+                        }
+                        1, 2, 3 -> {
+                            val phrase = speakerEnrollTexts[speakerEnrollStep - 1]
+                            Text("请朗读以下文本：")
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(4.dp),
+                                backgroundColor = md2CardContainerColor()
+                            ) {
+                                Text(
+                                    text = phrase,
+                                    modifier = Modifier.padding(10.dp),
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+                            }
+                            if (speakerEnrollCountingDown) {
+                                Text(
+                                    "倒计时：${speakerEnrollCountdown}",
+                                    style = MaterialTheme.typography.h4,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    "倒计时结束后将自动开始录音。",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            } else if (speakerEnrollReading) {
+                                Text(
+                                    "录制中，剩余 ${String.format(Locale.US, "%.1f", speakerEnrollRemainingSec)}s",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                LinearProgressIndicator(
+                                    progress = speakerEnrollProgress.coerceIn(0f, 1f),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Text("实时音量", style = MaterialTheme.typography.bodySmall)
+                                LinearProgressIndicator(
+                                    progress = speakerEnrollLevel.coerceIn(0f, 1f),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            } else {
+                                Text(
+                                    "点击“开始朗读”后会先倒计时，再开始计时录音。",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                        else -> {
+                            Text(if (speakerEnrollSuccess) "注册完成" else "注册失败")
+                            Text(speakerEnrollMessage, style = MaterialTheme.typography.bodySmall)
+                            Text(
+                                "你可以直接完成，或重新打开注册流程重录。",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                when (speakerEnrollStep) {
+                    0 -> {
+                        TextButton(onClick = { speakerEnrollStep = 1 }) {
+                            Text("下一步")
+                        }
+                    }
+                    1, 2, 3 -> {
+                        TextButton(
+                            onClick = { startSpeakerEnrollStepCapture(speakerEnrollStep) },
+                            enabled = !(speakerEnrollReading || speakerEnrollCountingDown)
+                        ) {
+                            Text(
+                                when {
+                                    speakerEnrollCountingDown -> "倒计时中..."
+                                    speakerEnrollReading -> "录制中..."
+                                    else -> "开始朗读"
+                                }
+                            )
+                        }
+                    }
+                    else -> {
+                        TextButton(onClick = { closeSpeakerEnrollDialog() }) {
+                            Text("完成")
+                        }
+                    }
+                }
+            },
+            dismissButton = {
+                when (speakerEnrollStep) {
+                    0, 1, 2, 3 -> {
+                        TextButton(
+                            onClick = { closeSpeakerEnrollDialog() },
+                            enabled = !(speakerEnrollReading || speakerEnrollCountingDown)
+                        ) {
+                            Text("取消")
+                        }
+                    }
+                    else -> {
+                        TextButton(onClick = {
+                            speakerEnrollSamples.clear()
+                            speakerEnrollStep = 0
+                            speakerEnrollCountingDown = false
+                            speakerEnrollCountdown = 3
+                            speakerEnrollReading = false
+                            speakerEnrollProgress = 0f
+                            speakerEnrollLevel = 0f
+                            speakerEnrollRemainingSec = 4f
+                            speakerEnrollSuccess = false
+                            speakerEnrollMessage = "请按页面引导完成注册。"
+                            speakerEnrollRetryDialog = false
+                        }) {
+                            Text("重新注册")
+                        }
+                    }
+                }
+            }
+        )
+    }
+
+    if (speakerEnrollRetryDialog) {
+        AlertDialog(
+            onDismissRequest = { speakerEnrollRetryDialog = false },
+            title = { Text("录制失败") },
+            text = { Text("${speakerEnrollMessage}\n请重录当前句子。") },
+            confirmButton = {
+                TextButton(onClick = { speakerEnrollRetryDialog = false }) {
+                    Text("重录")
+                }
+            }
+        )
     }
 }
 

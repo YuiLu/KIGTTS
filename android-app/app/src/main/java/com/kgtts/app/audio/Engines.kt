@@ -36,6 +36,9 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.ln
 import java.util.concurrent.atomic.AtomicLong
 
 object AudioRoutePreference {
@@ -669,6 +672,192 @@ class Aec3Processor(private val captureSampleRate: Int) {
     }
 }
 
+data class SpeakerEnrollResult(
+    val success: Boolean,
+    val message: String,
+    val profile: FloatArray? = null
+)
+
+private object SpeakerVerifier {
+    private const val FRAME_SIZE = 128
+    private const val HOP_SIZE = 64
+    private const val MIN_VOICED_FRAMES = 6
+    private const val MIN_RMS = 0.01f
+    private const val MAX_ANALYZE_SAMPLES = 24000 // ~1.5s @16kHz
+
+    // 0-4kHz coarse bands for 16kHz speech.
+    private val bandRanges = arrayOf(
+        1..2,   // 125-250
+        3..4,   // 375-500
+        5..8,   // 625-1000
+        9..16,  // 1125-2000
+        17..24, // 2125-3000
+        25..32  // 3125-4000
+    )
+
+    private val cosTable: Array<DoubleArray> by lazy {
+        Array(FRAME_SIZE / 2 + 1) { k ->
+            DoubleArray(FRAME_SIZE) { n ->
+                cos(2.0 * Math.PI * k * n / FRAME_SIZE)
+            }
+        }
+    }
+
+    private val sinTable: Array<DoubleArray> by lazy {
+        Array(FRAME_SIZE / 2 + 1) { k ->
+            DoubleArray(FRAME_SIZE) { n ->
+                sin(2.0 * Math.PI * k * n / FRAME_SIZE)
+            }
+        }
+    }
+
+    private val hammingWindow: FloatArray by lazy {
+        FloatArray(FRAME_SIZE) { i ->
+            (0.54 - 0.46 * cos(2.0 * Math.PI * i / (FRAME_SIZE - 1))).toFloat()
+        }
+    }
+
+    fun computeEmbedding(samples: FloatArray, sampleRate: Int): FloatArray? {
+        if (sampleRate <= 0 || samples.size < FRAME_SIZE) return null
+        val usable = min(samples.size, MAX_ANALYZE_SAMPLES)
+        val clipped = samples.copyOfRange(0, usable)
+        val frameFeatures = ArrayList<FloatArray>(usable / HOP_SIZE + 1)
+        var idx = 0
+        while (idx + FRAME_SIZE <= clipped.size) {
+            val frame = FloatArray(FRAME_SIZE)
+            var mean = 0f
+            for (i in 0 until FRAME_SIZE) {
+                mean += clipped[idx + i]
+            }
+            mean /= FRAME_SIZE.toFloat()
+            var sumSq = 0.0
+            for (i in 0 until FRAME_SIZE) {
+                val v = (clipped[idx + i] - mean) * hammingWindow[i]
+                frame[i] = v
+                sumSq += v * v
+            }
+            val rms = sqrt(sumSq / FRAME_SIZE).toFloat()
+            if (rms >= MIN_RMS) {
+                val zcr = frameZcr(frame)
+                val bands = frameBandEnergies(frame)
+                val feat = FloatArray(2 + bands.size)
+                feat[0] = rms
+                feat[1] = zcr
+                for (b in bands.indices) {
+                    feat[2 + b] = bands[b]
+                }
+                frameFeatures.add(feat)
+            }
+            idx += HOP_SIZE
+        }
+        if (frameFeatures.size < MIN_VOICED_FRAMES) return null
+        return aggregateFeatures(frameFeatures)
+    }
+
+    fun cosineSimilarity(a: FloatArray, b: FloatArray): Float {
+        if (a.isEmpty() || b.isEmpty()) return 0f
+        val n = min(a.size, b.size)
+        var dot = 0.0
+        var na = 0.0
+        var nb = 0.0
+        for (i in 0 until n) {
+            val av = a[i].toDouble()
+            val bv = b[i].toDouble()
+            dot += av * bv
+            na += av * av
+            nb += bv * bv
+        }
+        if (na <= 1e-12 || nb <= 1e-12) return 0f
+        return (dot / (sqrt(na) * sqrt(nb))).toFloat().coerceIn(-1f, 1f)
+    }
+
+    private fun frameZcr(frame: FloatArray): Float {
+        var count = 0
+        for (i in 1 until frame.size) {
+            val a = frame[i - 1]
+            val b = frame[i]
+            if ((a >= 0f && b < 0f) || (a < 0f && b >= 0f)) {
+                count++
+            }
+        }
+        return count.toFloat() / frame.size.toFloat()
+    }
+
+    private fun frameBandEnergies(frame: FloatArray): FloatArray {
+        val bins = FRAME_SIZE / 2
+        val spectrum = FloatArray(bins + 1)
+        for (k in 1..bins) {
+            var re = 0.0
+            var im = 0.0
+            val cosK = cosTable[k]
+            val sinK = sinTable[k]
+            for (n in frame.indices) {
+                val v = frame[n].toDouble()
+                re += v * cosK[n]
+                im -= v * sinK[n]
+            }
+            spectrum[k] = (re * re + im * im).toFloat()
+        }
+        val out = FloatArray(bandRanges.size)
+        for (i in bandRanges.indices) {
+            val range = bandRanges[i]
+            var sum = 0.0
+            var cnt = 0
+            for (k in range) {
+                if (k in 0..bins) {
+                    sum += spectrum[k]
+                    cnt++
+                }
+            }
+            val v = if (cnt > 0) sum / cnt else 0.0
+            out[i] = ln(1.0 + v).toFloat()
+        }
+        return out
+    }
+
+    private fun aggregateFeatures(features: List<FloatArray>): FloatArray {
+        val dim = features.first().size
+        val mean = FloatArray(dim)
+        val std = FloatArray(dim)
+        for (feat in features) {
+            for (i in 0 until dim) {
+                mean[i] += feat[i]
+            }
+        }
+        for (i in 0 until dim) {
+            mean[i] /= features.size.toFloat()
+        }
+        for (feat in features) {
+            for (i in 0 until dim) {
+                val d = feat[i] - mean[i]
+                std[i] += d * d
+            }
+        }
+        for (i in 0 until dim) {
+            std[i] = sqrt(std[i] / features.size.toFloat())
+        }
+        val out = FloatArray(dim * 2)
+        for (i in 0 until dim) {
+            out[i] = mean[i]
+            out[i + dim] = std[i]
+        }
+        normalizeInPlace(out)
+        return out
+    }
+
+    private fun normalizeInPlace(v: FloatArray) {
+        var sumSq = 0.0
+        for (x in v) {
+            sumSq += x * x
+        }
+        val norm = sqrt(sumSq)
+        if (norm <= 1e-8) return
+        for (i in v.indices) {
+            v[i] = (v[i] / norm).toFloat()
+        }
+    }
+}
+
 class RealtimeController(
     private val context: Context,
     private val scope: CoroutineScope,
@@ -679,6 +868,7 @@ class RealtimeController(
     private val onOutputDevice: (String) -> Unit,
     private val onAec3Status: (String) -> Unit,
     private val onAec3Diag: (String) -> Unit,
+    private val onSpeakerVerify: (Float, Boolean) -> Unit,
     private val onError: (String) -> Unit,
     initialSuppressWhilePlaying: Boolean,
     initialUseVoiceCommunication: Boolean,
@@ -691,6 +881,9 @@ class RealtimeController(
     initialUseAec3: Boolean,
     initialNumberReplaceMode: Int,
     initialAllowSystemAecWithAec3: Boolean,
+    initialSpeakerVerifyEnabled: Boolean,
+    initialSpeakerVerifyThreshold: Float,
+    initialSpeakerProfile: FloatArray?,
     private val moduleFactory: SpeechModuleFactory = DefaultSpeechModuleFactory
 ) {
     private var recorder: AudioRecord? = null
@@ -714,6 +907,10 @@ class RealtimeController(
     @Volatile private var useAec3 = initialUseAec3
     @Volatile private var numberReplaceMode = initialNumberReplaceMode.coerceIn(0, 2)
     @Volatile private var allowSystemAecWithAec3 = initialAllowSystemAecWithAec3
+    @Volatile private var speakerVerifyEnabled = initialSpeakerVerifyEnabled
+    @Volatile private var speakerVerifyThreshold = initialSpeakerVerifyThreshold.coerceIn(0.4f, 0.95f)
+    @Volatile private var speakerProfile: FloatArray? = initialSpeakerProfile?.copyOf()
+    @Volatile private var speakerLastSimilarity: Float = -1f
     private val lastRenderMs = AtomicLong(0L)
     private val lastCaptureMs = AtomicLong(0L)
     private val renderFrames = AtomicLong(0L)
@@ -783,6 +980,10 @@ class RealtimeController(
 
     private fun notifyAec3Diag(diag: String) {
         scope.launch { onAec3Diag(diag) }
+    }
+
+    private fun notifySpeakerVerify(similarity: Float, passed: Boolean) {
+        scope.launch { onSpeakerVerify(similarity, passed) }
     }
 
     private fun notifyError(msg: String) {
@@ -869,6 +1070,34 @@ class RealtimeController(
 
     fun setAllowSystemAecWithAec3(enabled: Boolean) {
         allowSystemAecWithAec3 = enabled
+    }
+
+    fun setSpeakerVerifyEnabled(enabled: Boolean) {
+        speakerVerifyEnabled = enabled
+    }
+
+    fun setSpeakerVerifyThreshold(threshold: Float) {
+        speakerVerifyThreshold = threshold.coerceIn(0.4f, 0.95f)
+    }
+
+    fun setSpeakerProfile(profile: FloatArray?) {
+        speakerProfile = profile?.copyOf()
+        if (profile == null || profile.isEmpty()) {
+            speakerLastSimilarity = -1f
+        }
+    }
+
+    fun clearSpeakerProfile() {
+        speakerProfile = null
+        speakerLastSimilarity = -1f
+    }
+
+    fun hasSpeakerProfile(): Boolean {
+        return (speakerProfile?.isNotEmpty() == true)
+    }
+
+    fun latestSpeakerSimilarity(): Float {
+        return speakerLastSimilarity
     }
 
     private fun enqueueTts(text: String): Long {
@@ -970,6 +1199,114 @@ class RealtimeController(
                 return@withLock false
             }
             true
+        }
+    }
+
+    suspend fun enrollSpeaker(
+        durationSec: Float = 4f,
+        onCapture: ((progress: Float, level: Float) -> Unit)? = null
+    ): SpeakerEnrollResult {
+        return recorderMutex.withLock {
+            if (recorder != null) {
+                return@withLock SpeakerEnrollResult(
+                    success = false,
+                    message = "请先停止麦克风再注册说话人"
+                )
+            }
+            val seconds = durationSec.coerceIn(2f, 8f)
+            val sampleCount = (sampleRate * seconds).roundToInt().coerceAtLeast(sampleRate)
+            onCapture?.invoke(0f, 0f)
+            val minBuf = AudioRecord.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val source = if (useVoiceCommunication) {
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            } else {
+                MediaRecorder.AudioSource.MIC
+            }
+            val rec = AudioRecord(
+                source,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                max(minBuf, 4096)
+            )
+            if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                rec.release()
+                return@withLock SpeakerEnrollResult(
+                    success = false,
+                    message = "说话人注册失败：录音初始化失败"
+                )
+            }
+            applyInputRoutePreference(rec)
+            val temp = ShortArray(1024)
+            val captured = FloatArray(sampleCount)
+            var offset = 0
+            var levelEma = 0f
+            try {
+                rec.startRecording()
+                while (offset < sampleCount) {
+                    val read = rec.read(temp, 0, min(temp.size, sampleCount - offset))
+                    if (read <= 0) continue
+                    var sumSq = 0.0
+                    for (i in 0 until read) {
+                        val v = temp[i] / 32768f
+                        captured[offset + i] = v
+                        sumSq += v * v
+                    }
+                    offset += read
+                    val chunkRms = if (read > 0) sqrt(sumSq / read).toFloat() else 0f
+                    levelEma = levelEma * 0.82f + chunkRms * 0.18f
+                    val normalizedLevel = (levelEma / 0.2f).coerceIn(0f, 1f)
+                    val progress = (offset.toFloat() / sampleCount.toFloat()).coerceIn(0f, 1f)
+                    onCapture?.invoke(progress, normalizedLevel)
+                }
+            } catch (e: Exception) {
+                AppLogger.e("Speaker enroll read failed", e)
+                return@withLock SpeakerEnrollResult(
+                    success = false,
+                    message = "说话人注册失败：${e.message ?: "录音异常"}"
+                )
+            } finally {
+                try {
+                    rec.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    rec.release()
+                } catch (_: Exception) {
+                }
+            }
+            if (offset < sampleRate / 2) {
+                return@withLock SpeakerEnrollResult(
+                    success = false,
+                    message = "说话人注册失败：录音时长不足"
+                )
+            }
+            onCapture?.invoke(1f, 0f)
+            val audio = if (offset == captured.size) captured else captured.copyOf(offset)
+            val rms = rmsEnergy(audio)
+            if (rms < 0.008) {
+                return@withLock SpeakerEnrollResult(
+                    success = false,
+                    message = "说话人注册失败：音量过低，请靠近麦克风"
+                )
+            }
+            val embedding = SpeakerVerifier.computeEmbedding(audio, sampleRate)
+                ?: return@withLock SpeakerEnrollResult(
+                    success = false,
+                    message = "说话人注册失败：有效语音不足"
+                )
+            speakerProfile = embedding.copyOf()
+            speakerLastSimilarity = 1f
+            notifySpeakerVerify(1f, true)
+            SpeakerEnrollResult(
+                success = true,
+                message = "说话人注册成功",
+                profile = embedding
+            )
         }
     }
 
@@ -1285,6 +1622,18 @@ class RealtimeController(
                         val minSegmentEnergy = minSegmentRms
                         if (rms >= minSegmentEnergy) {
                             scope.launch(Dispatchers.IO) asrTask@{
+                                val profileSnapshot = speakerProfile
+                                if (speakerVerifyEnabled && profileSnapshot != null && profileSnapshot.isNotEmpty()) {
+                                    val segEmbedding = SpeakerVerifier.computeEmbedding(audio, sampleRate)
+                                        ?: return@asrTask
+                                    val similarity = SpeakerVerifier.cosineSimilarity(profileSnapshot, segEmbedding)
+                                    speakerLastSimilarity = similarity
+                                    val passed = similarity >= speakerVerifyThreshold
+                                    notifySpeakerVerify(similarity, passed)
+                                    if (!passed) {
+                                        return@asrTask
+                                    }
+                                }
                                 val rawText = try {
                                     asr?.transcribe(audio, sampleRate) ?: ""
                                 } catch (e: Exception) {

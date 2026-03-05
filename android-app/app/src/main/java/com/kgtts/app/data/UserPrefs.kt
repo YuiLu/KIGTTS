@@ -36,6 +36,9 @@ object UserPrefs {
     private val KEY_DRAWING_SAVE_RELATIVE_PATH = stringPreferencesKey("drawing_save_relative_path")
     private val KEY_ASR_SEND_TO_QUICK_SUBTITLE = booleanPreferencesKey("asr_send_to_quick_subtitle")
     private val KEY_QUICK_SUBTITLE_CONFIG = stringPreferencesKey("quick_subtitle_config")
+    private val KEY_SPEAKER_VERIFY_ENABLED = booleanPreferencesKey("speaker_verify_enabled")
+    private val KEY_SPEAKER_VERIFY_THRESHOLD = floatPreferencesKey("speaker_verify_threshold")
+    private val KEY_SPEAKER_VERIFY_PROFILE = stringPreferencesKey("speaker_verify_profile")
 
     data class AppSettings(
         val muteWhilePlaying: Boolean = false,
@@ -53,6 +56,9 @@ object UserPrefs {
         val solidTopBar: Boolean = true,
         val drawingSaveRelativePath: String = DEFAULT_DRAWING_SAVE_RELATIVE_PATH,
         val asrSendToQuickSubtitle: Boolean = true,
+        val speakerVerifyEnabled: Boolean = false,
+        val speakerVerifyThreshold: Float = 0.72f,
+        val speakerVerifyProfileCsv: String = "",
         val allowSystemAecWithAec3: Boolean = true
     )
 
@@ -91,6 +97,9 @@ object UserPrefs {
             drawingSaveRelativePath = (prefs[KEY_DRAWING_SAVE_RELATIVE_PATH]
                 ?: DEFAULT_DRAWING_SAVE_RELATIVE_PATH).ifBlank { DEFAULT_DRAWING_SAVE_RELATIVE_PATH },
             asrSendToQuickSubtitle = prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] ?: true,
+            speakerVerifyEnabled = prefs[KEY_SPEAKER_VERIFY_ENABLED] ?: false,
+            speakerVerifyThreshold = (prefs[KEY_SPEAKER_VERIFY_THRESHOLD] ?: 0.72f).coerceIn(0.4f, 0.95f),
+            speakerVerifyProfileCsv = prefs[KEY_SPEAKER_VERIFY_PROFILE] ?: "",
             allowSystemAecWithAec3 = true
         )
     }
@@ -191,6 +200,38 @@ object UserPrefs {
         context.dataStore.edit { prefs ->
             prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] = enabled
         }
+    }
+
+    suspend fun setSpeakerVerifyEnabled(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_SPEAKER_VERIFY_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setSpeakerVerifyThreshold(context: Context, threshold: Float) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_SPEAKER_VERIFY_THRESHOLD] = threshold.coerceIn(0.4f, 0.95f)
+        }
+    }
+
+    suspend fun setSpeakerVerifyProfile(context: Context, vector: FloatArray?) {
+        context.dataStore.edit { prefs ->
+            val csv = if (vector == null || vector.isEmpty()) {
+                ""
+            } else {
+                vector.joinToString(",")
+            }
+            prefs[KEY_SPEAKER_VERIFY_PROFILE] = csv
+        }
+    }
+
+    fun parseSpeakerVerifyProfile(csv: String?): FloatArray? {
+        val raw = csv?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+        val values = raw.split(",")
+            .mapNotNull { token -> token.trim().toFloatOrNull() }
+            .toFloatArray()
+        return if (values.isEmpty()) null else values
     }
 
     suspend fun getQuickSubtitleConfig(context: Context): String? {
