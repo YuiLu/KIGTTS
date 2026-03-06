@@ -2725,6 +2725,7 @@ private fun AppDrawerContent(
     horizontalStartInset: Dp = 0.dp,
     onSelect: (Int) -> Unit
 ) {
+    val drawerLogoRes = if (isSystemInDarkTheme()) R.drawable.logo_white else R.drawable.logo_black
     val animatedItemStartPadding by animateDpAsState(
         targetValue = if (expanded) 16.dp else 27.dp,
         animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
@@ -2765,23 +2766,18 @@ private fun AppDrawerContent(
     ) {
         Spacer(Modifier.height(topInset))
         if (showHeader && expanded) {
-            Text(
-                text = "KIGTTS",
-                modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
-        } else if (showHeader) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 12.dp),
-                contentAlignment = Alignment.Center
+                    .padding(horizontal = 20.dp, vertical = 12.dp),
+                contentAlignment = Alignment.CenterStart
             ) {
-                Text(
-                    text = "KI",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
+                androidx.compose.foundation.Image(
+                    painter = androidx.compose.ui.res.painterResource(id = drawerLogoRes),
+                    contentDescription = "KIGTTS",
+                    modifier = Modifier
+                        .fillMaxWidth(0.95f)
+                        .height(32.dp)
                 )
             }
         }

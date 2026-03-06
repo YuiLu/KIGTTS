@@ -1,0 +1,4 @@
+<resources>
+    <color name="splash_background_day">#FFFFFFFF</color>
+    <color name="splash_background_night">#1D2023</color>
+</resources>
