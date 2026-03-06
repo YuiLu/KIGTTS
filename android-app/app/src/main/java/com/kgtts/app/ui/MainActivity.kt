@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -48,10 +49,12 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.indication
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.PressInteraction
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -128,6 +131,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -263,6 +267,8 @@ data class UiState(
     val solidTopBar: Boolean = true,
     val drawingSaveRelativePath: String = UserPrefs.DEFAULT_DRAWING_SAVE_RELATIVE_PATH,
     val asrSendToQuickSubtitle: Boolean = true,
+    val pushToTalkMode: Boolean = false,
+    val pushToTalkPressed: Boolean = false,
     val speakerVerifyEnabled: Boolean = false,
     val speakerVerifyThreshold: Float = 0.72f,
     val speakerProfileReady: Boolean = false,
@@ -812,6 +818,7 @@ class MainViewModel(
                 solidTopBar = settings.solidTopBar,
                 drawingSaveRelativePath = normalizeDrawingSaveRelativePath(settings.drawingSaveRelativePath),
                 asrSendToQuickSubtitle = settings.asrSendToQuickSubtitle,
+                pushToTalkMode = settings.pushToTalkMode,
                 speakerVerifyEnabled = speakerVerifyEnabled,
                 speakerVerifyThreshold = settings.speakerVerifyThreshold,
                 speakerProfileReady = hasProfiles,
@@ -1017,6 +1024,21 @@ class MainViewModel(
         viewModelScope.launch {
             UserPrefs.setAsrSendToQuickSubtitle(appContext, enabled)
         }
+    }
+
+    fun setPushToTalkMode(enabled: Boolean) {
+        uiState = uiState.copy(
+            pushToTalkMode = enabled,
+            pushToTalkPressed = false
+        )
+        viewModelScope.launch {
+            UserPrefs.setPushToTalkMode(appContext, enabled)
+        }
+    }
+
+    fun setPushToTalkPressed(pressed: Boolean) {
+        if (uiState.pushToTalkPressed == pressed) return
+        uiState = uiState.copy(pushToTalkPressed = pressed)
     }
 
     fun canAddSpeakerProfile(): Boolean {
@@ -1475,7 +1497,7 @@ class MainViewModel(
         restartJob?.cancel()
         restartJob = null
         val activeController = controller ?: run {
-            uiState = uiState.copy(running = false, status = "麦克风已停止")
+            uiState = uiState.copy(running = false, status = "麦克风已停止", pushToTalkPressed = false)
             return
         }
         viewModelScope.launch {
@@ -1485,7 +1507,7 @@ class MainViewModel(
             KeepAliveService.stop(appContext)
             realtimeInputLevel = 0f
             realtimePlaybackProgress = 0f
-            uiState = uiState.copy(running = false, status = "麦克风已停止")
+            uiState = uiState.copy(running = false, status = "麦克风已停止", pushToTalkPressed = false)
         }
     }
 
@@ -2018,6 +2040,7 @@ private fun Md2OutlinedField(
 }
 
 @Composable
+@OptIn(ExperimentalComposeUiApi::class)
 fun AppScaffold(viewModel: MainViewModel) {
     val pageRealtime = 0
     val pageQuickSubtitle = 1
@@ -2101,7 +2124,13 @@ fun AppScaffold(viewModel: MainViewModel) {
     val settingsLogOpen =
         basePage == pageSettings && settingsRoute == SettingsRoutes.Log
     var drawerExpanded by rememberSaveable { mutableStateOf(false) }
-    val showRunningStrip = state.running && !(drawingFullscreen && basePage == pageDrawing)
+    val runningStripEligible = !(drawingFullscreen && basePage == pageDrawing)
+    val showRunningStripButton = (state.running || state.pushToTalkMode) && runningStripEligible
+    val showRunningStripPanel = when {
+        !runningStripEligible -> false
+        state.pushToTalkMode -> !runningStripCollapsed
+        else -> state.running && !runningStripCollapsed
+    }
     val topMicLevel = viewModel.realtimeInputLevel
     val topPlaybackProgress = viewModel.realtimePlaybackProgress
     val drawerItems = listOf(
@@ -2142,8 +2171,13 @@ fun AppScaffold(viewModel: MainViewModel) {
             scope.launch { drawerState.close() }
         }
     }
-    LaunchedEffect(state.running) {
-        if (!state.running) runningStripCollapsed = false
+    LaunchedEffect(state.pushToTalkMode) {
+        if (state.pushToTalkMode) {
+            runningStripCollapsed = true
+        }
+    }
+    LaunchedEffect(state.running, state.pushToTalkMode) {
+        if (!state.pushToTalkMode && !state.running) runningStripCollapsed = false
     }
     LaunchedEffect(basePage, settingsLogOpen) {
         if (!settingsLogOpen) {
@@ -2224,6 +2258,26 @@ fun AppScaffold(viewModel: MainViewModel) {
             permLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
+    val onPushToTalkPressStart = {
+        viewModel.setPushToTalkPressed(true)
+        if (!state.running) {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                viewModel.start()
+            } else {
+                permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+    }
+    val onPushToTalkPressEnd = {
+        viewModel.setPushToTalkPressed(false)
+        if (state.running) {
+            viewModel.stop()
+        }
+    }
 
     val topBar: @Composable ((() -> Unit)) -> Unit = { onNavClick ->
         val currentTitle = if (quickSubtitleEditorOpen) {
@@ -2264,7 +2318,7 @@ fun AppScaffold(viewModel: MainViewModel) {
                             Text(titleText)
                         }
                         AnimatedVisibility(
-                            visible = showRunningStrip,
+                            visible = showRunningStripButton,
                             enter = fadeIn(animationSpec = tween(140)) +
                                     androidx.compose.animation.slideInHorizontally(
                                         initialOffsetX = { full -> full / 3 },
@@ -2280,6 +2334,8 @@ fun AppScaffold(viewModel: MainViewModel) {
                                 micLevel = topMicLevel,
                                 playbackProgress = topPlaybackProgress,
                                 expanded = !runningStripCollapsed,
+                                pushToTalkMode = state.pushToTalkMode,
+                                pushToTalkPressed = state.pushToTalkPressed,
                                 contentColor = topBarContentColor,
                                 onToggle = { runningStripCollapsed = !runningStripCollapsed }
                             )
@@ -2319,110 +2375,145 @@ fun AppScaffold(viewModel: MainViewModel) {
                     }
                 },
                 actions = {
-                    val actionState = basePage to quickSubtitleEditorOpen
-                    Crossfade(
-                        targetState = actionState,
-                        animationSpec = tween(durationMillis = 130),
-                        label = "topbar_actions_switch"
-                    ) { (pageForAction, editorOpen) ->
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(0.dp)
-                        ) {
-                            when (pageForAction) {
-                                pageQuickSubtitle -> {
-                                    if (!editorOpen) {
-                                        IconButton(
-                                            onClick = { quickSubtitleFullscreen = !quickSubtitleFullscreen }
-                                        ) {
-                                            MsIcon(
-                                                name = if (quickSubtitleFullscreen) "fullscreen_exit" else "fullscreen",
-                                                contentDescription = if (quickSubtitleFullscreen) "退出全屏" else "进入全屏"
-                                            )
-                                        }
-                                    }
-                                }
-                                pageDrawing -> {
-                                    val canSaveDrawing = viewModel.drawStrokes.isNotEmpty()
-                                    IconButton(
-                                        onClick = { viewModel.saveDrawingSnapshot() },
-                                        enabled = canSaveDrawing
-                                    ) {
-                                        MsIcon("save", contentDescription = "保存画板")
-                                    }
-                                }
-                                pageVoicePack -> {
-                                    IconButton(onClick = { voicePicker.launch("*/*") }) {
-                                        MsIcon("folder_open", contentDescription = "导入语音包")
-                                    }
-                                }
-                                pageSettings -> {
-                                    val entryAlpha by animateFloatAsState(
-                                        targetValue = if (settingsLogOpen) 0f else 1f,
-                                        animationSpec = tween(130, easing = FastOutSlowInEasing),
-                                        label = "settings_log_entry_alpha"
-                                    )
-                                    val actionsAlpha by animateFloatAsState(
-                                        targetValue = if (settingsLogOpen) 1f else 0f,
-                                        animationSpec = tween(130, easing = FastOutSlowInEasing),
-                                        label = "settings_log_actions_alpha"
-                                    )
-                                    val actions = logTopBarActions
+                    val showQuickSubtitleActions = basePage == pageQuickSubtitle && !quickSubtitleEditorOpen
+                    val showDrawingActions = basePage == pageDrawing
+                    val showVoicePackActions = basePage == pageVoicePack
+                    val showSettingsEntryActions = basePage == pageSettings && !settingsLogOpen
+                    val showSettingsLogActions = basePage == pageSettings && settingsLogOpen
+                    val settingsActions = logTopBarActions
 
-                                    Box(
-                                        modifier = Modifier.width(144.dp),
-                                        contentAlignment = Alignment.CenterEnd
-                                    ) {
-                                        key("settings_log_entry_layer") {
-                                            Row(
-                                                modifier = Modifier
-                                                    .align(Alignment.CenterEnd)
-                                                    .graphicsLayer { alpha = entryAlpha }
-                                                    .zIndex(if (!settingsLogOpen) 2f else 0f),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.End
-                                            ) {
-                                                IconButton(
-                                                    onClick = { settingsNavController.navigate(SettingsRoutes.Log) },
-                                                    enabled = !settingsLogOpen
-                                                ) {
-                                                    MsIcon("article", contentDescription = "打开日志")
-                                                }
-                                            }
-                                        }
+                    val quickSubtitleAlpha by animateFloatAsState(
+                        targetValue = if (showQuickSubtitleActions) 1f else 0f,
+                        animationSpec = tween(130, easing = FastOutSlowInEasing),
+                        label = "topbar_quick_subtitle_actions_alpha"
+                    )
+                    val drawingAlpha by animateFloatAsState(
+                        targetValue = if (showDrawingActions) 1f else 0f,
+                        animationSpec = tween(130, easing = FastOutSlowInEasing),
+                        label = "topbar_drawing_actions_alpha"
+                    )
+                    val voicePackAlpha by animateFloatAsState(
+                        targetValue = if (showVoicePackActions) 1f else 0f,
+                        animationSpec = tween(130, easing = FastOutSlowInEasing),
+                        label = "topbar_voicepack_actions_alpha"
+                    )
+                    val settingsEntryAlpha by animateFloatAsState(
+                        targetValue = if (showSettingsEntryActions) 1f else 0f,
+                        animationSpec = tween(130, easing = FastOutSlowInEasing),
+                        label = "topbar_settings_entry_alpha"
+                    )
+                    val settingsLogAlpha by animateFloatAsState(
+                        targetValue = if (showSettingsLogActions) 1f else 0f,
+                        animationSpec = tween(130, easing = FastOutSlowInEasing),
+                        label = "topbar_settings_log_actions_alpha"
+                    )
 
-                                        key("settings_log_actions_layer") {
-                                            Row(
-                                                modifier = Modifier
-                                                    .align(Alignment.CenterEnd)
-                                                    .graphicsLayer { alpha = actionsAlpha }
-                                                    .zIndex(if (settingsLogOpen) 2f else 0f),
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                horizontalArrangement = Arrangement.End
-                                            ) {
-                                                IconButton(
-                                                    onClick = { actions?.onRefresh?.invoke() },
-                                                    enabled = settingsLogOpen && actions != null
-                                                ) {
-                                                    MsIcon("refresh", contentDescription = "刷新日志")
-                                                }
-                                                IconButton(
-                                                    onClick = { actions?.onCopy?.invoke() },
-                                                    enabled = settingsLogOpen && actions?.canCopy == true
-                                                ) {
-                                                    MsIcon("content_copy", contentDescription = "复制日志")
-                                                }
-                                                IconButton(
-                                                    onClick = { actions?.onShare?.invoke() },
-                                                    enabled = settingsLogOpen && actions?.canShare == true
-                                                ) {
-                                                    MsIcon("share", contentDescription = "分享日志")
-                                                }
-                                            }
-                                        }
-                                    }
+                    Box(
+                        modifier = Modifier.width(144.dp),
+                        contentAlignment = Alignment.CenterEnd
+                    ) {
+                        key("topbar_quick_subtitle_actions_layer") {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .graphicsLayer { alpha = quickSubtitleAlpha }
+                                    .zIndex(if (showQuickSubtitleActions) 2f else 0f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                IconButton(
+                                    onClick = { quickSubtitleFullscreen = !quickSubtitleFullscreen },
+                                    enabled = showQuickSubtitleActions
+                                ) {
+                                    MsIcon(
+                                        name = if (quickSubtitleFullscreen) "fullscreen_exit" else "fullscreen",
+                                        contentDescription = if (quickSubtitleFullscreen) "退出全屏" else "进入全屏"
+                                    )
                                 }
-                                else -> Unit
+                            }
+                        }
+
+                        key("topbar_drawing_actions_layer") {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .graphicsLayer { alpha = drawingAlpha }
+                                    .zIndex(if (showDrawingActions) 2f else 0f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                IconButton(
+                                    onClick = { viewModel.saveDrawingSnapshot() },
+                                    enabled = showDrawingActions && viewModel.drawStrokes.isNotEmpty()
+                                ) {
+                                    MsIcon("save", contentDescription = "保存画板")
+                                }
+                            }
+                        }
+
+                        key("topbar_voicepack_actions_layer") {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .graphicsLayer { alpha = voicePackAlpha }
+                                    .zIndex(if (showVoicePackActions) 2f else 0f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                IconButton(
+                                    onClick = { voicePicker.launch("*/*") },
+                                    enabled = showVoicePackActions
+                                ) {
+                                    MsIcon("folder_open", contentDescription = "导入语音包")
+                                }
+                            }
+                        }
+
+                        key("topbar_settings_log_entry_layer") {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .graphicsLayer { alpha = settingsEntryAlpha }
+                                    .zIndex(if (showSettingsEntryActions) 2f else 0f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                IconButton(
+                                    onClick = { settingsNavController.navigate(SettingsRoutes.Log) },
+                                    enabled = showSettingsEntryActions
+                                ) {
+                                    MsIcon("article", contentDescription = "打开日志")
+                                }
+                            }
+                        }
+
+                        key("topbar_settings_log_actions_layer") {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.CenterEnd)
+                                    .graphicsLayer { alpha = settingsLogAlpha }
+                                    .zIndex(if (showSettingsLogActions) 2f else 0f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.End
+                            ) {
+                                IconButton(
+                                    onClick = { settingsActions?.onRefresh?.invoke() },
+                                    enabled = showSettingsLogActions && settingsActions != null
+                                ) {
+                                    MsIcon("refresh", contentDescription = "刷新日志")
+                                }
+                                IconButton(
+                                    onClick = { settingsActions?.onCopy?.invoke() },
+                                    enabled = showSettingsLogActions && settingsActions?.canCopy == true
+                                ) {
+                                    MsIcon("content_copy", contentDescription = "复制日志")
+                                }
+                                IconButton(
+                                    onClick = { settingsActions?.onShare?.invoke() },
+                                    enabled = showSettingsLogActions && settingsActions?.canShare == true
+                                ) {
+                                    MsIcon("share", contentDescription = "分享日志")
+                                }
                             }
                         }
                     }
@@ -2436,21 +2527,87 @@ fun AppScaffold(viewModel: MainViewModel) {
 
     val fab: @Composable () -> Unit = {
         if (basePage == pageRealtime) {
-            FloatingActionButton(
-                onClick = onToggleRun,
-                backgroundColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                shape = CircleShape,
-                elevation = FloatingActionButtonDefaults.elevation(
-                    defaultElevation = UiTokens.FabElevation,
-                    pressedElevation = 12.dp
-                )
-            ) {
-                MsIcon(
-                    name = if (state.running) "stop" else "play_arrow",
-                    contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
-                    tint = MaterialTheme.colorScheme.onPrimary
-                )
+            if (state.pushToTalkMode) {
+                var pushToTalkPressed by remember { mutableStateOf(false) }
+                val pttInteractionSource = remember { MutableInteractionSource() }
+                var pttPress by remember { mutableStateOf<PressInteraction.Press?>(null) }
+                FloatingActionButton(
+                    onClick = {},
+                    modifier = Modifier
+                        .pointerInteropFilter { event ->
+                            when (event.actionMasked) {
+                                MotionEvent.ACTION_DOWN -> {
+                                    pushToTalkPressed = true
+                                    onPushToTalkPressStart()
+                                    val press = PressInteraction.Press(Offset(event.x, event.y))
+                                    pttPress = press
+                                    pttInteractionSource.tryEmit(press)
+                                    true
+                                }
+                                MotionEvent.ACTION_UP -> {
+                                    if (pushToTalkPressed) {
+                                        pushToTalkPressed = false
+                                        onPushToTalkPressEnd()
+                                    }
+                                    pttPress?.let { press ->
+                                        pttInteractionSource.tryEmit(PressInteraction.Release(press))
+                                    }
+                                    pttPress = null
+                                    true
+                                }
+                                MotionEvent.ACTION_CANCEL,
+                                MotionEvent.ACTION_OUTSIDE -> {
+                                    if (pushToTalkPressed) {
+                                        pushToTalkPressed = false
+                                        onPushToTalkPressEnd()
+                                    }
+                                    pttPress?.let { press ->
+                                        pttInteractionSource.tryEmit(PressInteraction.Cancel(press))
+                                    }
+                                    pttPress = null
+                                    true
+                                }
+                                else -> true
+                            }
+                        },
+                    interactionSource = pttInteractionSource,
+                    backgroundColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    shape = CircleShape,
+                    elevation = FloatingActionButtonDefaults.elevation(
+                        defaultElevation = UiTokens.FabElevation,
+                        pressedElevation = 12.dp
+                    )
+                ) {
+                    Crossfade(
+                        targetState = pushToTalkPressed,
+                        animationSpec = tween(durationMillis = 180),
+                        label = "realtime_ptt_fab_icon"
+                    ) { pressed ->
+                        MsIcon(
+                            name = if (pressed) "settings_voice" else "mic",
+                            contentDescription = if (pressed) "按住说话中" else "按住说话",
+                            tint = MaterialTheme.colorScheme.onPrimary
+                        )
+                    }
+                }
+            } else {
+                FloatingActionButton(
+                    onClick = onToggleRun,
+                    backgroundColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    shape = CircleShape,
+                    elevation = FloatingActionButtonDefaults.elevation(
+                        defaultElevation = UiTokens.FabElevation,
+                        pressedElevation = 12.dp
+                    )
+                ) {
+                    MsIcon(
+                        name = if (state.running) "stop" else "play_arrow",
+                        contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
+                        tint = MaterialTheme.colorScheme.onPrimary
+                    )
+                }
             }
         }
     }
@@ -2482,6 +2639,8 @@ fun AppScaffold(viewModel: MainViewModel) {
                         viewModel = viewModel,
                         state = state,
                         onToggleMic = onToggleRun,
+                        onPushToTalkPressStart = onPushToTalkPressStart,
+                        onPushToTalkPressEnd = onPushToTalkPressEnd,
                         fullscreenMode = quickSubtitleFullscreen && !quickSubtitleEditorOpen
                     )
                     pageVoicePack -> VoicePackScreen(viewModel, state)
@@ -2499,7 +2658,7 @@ fun AppScaffold(viewModel: MainViewModel) {
                 }
             }
             AnimatedVisibility(
-                visible = showRunningStrip && !runningStripCollapsed,
+                visible = showRunningStripPanel,
                 modifier = Modifier
                     .matchParentSize()
                     .zIndex(1f),
@@ -2518,7 +2677,7 @@ fun AppScaffold(viewModel: MainViewModel) {
                 )
             }
             AnimatedVisibility(
-                visible = showRunningStrip && !runningStripCollapsed,
+                visible = showRunningStripPanel,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .fillMaxWidth()
@@ -2537,6 +2696,8 @@ fun AppScaffold(viewModel: MainViewModel) {
                 RunningStatusTopStrip(
                     viewModel = viewModel,
                     status = state.status,
+                    pushToTalkMode = state.pushToTalkMode,
+                    pushToTalkPressed = state.pushToTalkPressed,
                     onToggleCollapsed = { runningStripCollapsed = !runningStripCollapsed },
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -3761,6 +3922,8 @@ private fun QuickSubtitleNavHost(
     viewModel: MainViewModel,
     state: UiState,
     onToggleMic: () -> Unit,
+    onPushToTalkPressStart: () -> Unit,
+    onPushToTalkPressEnd: () -> Unit,
     fullscreenMode: Boolean
 ) {
     NavHost(
@@ -3825,6 +3988,8 @@ private fun QuickSubtitleNavHost(
                 viewModel = viewModel,
                 state = state,
                 onToggleMic = onToggleMic,
+                onPushToTalkPressStart = onPushToTalkPressStart,
+                onPushToTalkPressEnd = onPushToTalkPressEnd,
                 onOpenEditor = { navController.navigate(QuickSubtitleRoutes.Editor) },
                 fullscreenMode = fullscreenMode
             )
@@ -3912,10 +4077,99 @@ private fun SettingsNavHost(
 }
 
 @Composable
+@OptIn(ExperimentalComposeUiApi::class)
+private fun QuickSubtitleMicFab(
+    state: UiState,
+    onToggleMic: () -> Unit,
+    onPushToTalkPressStart: () -> Unit,
+    onPushToTalkPressEnd: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var pushToTalkPressed by remember(state.pushToTalkMode) { mutableStateOf(false) }
+    val pttInteractionSource = remember { MutableInteractionSource() }
+    var pttPress by remember { mutableStateOf<PressInteraction.Press?>(null) }
+    val pttModifier = if (state.pushToTalkMode) {
+        modifier
+            .pointerInteropFilter { event ->
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        pushToTalkPressed = true
+                        onPushToTalkPressStart()
+                        val press = PressInteraction.Press(Offset(event.x, event.y))
+                        pttPress = press
+                        pttInteractionSource.tryEmit(press)
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (pushToTalkPressed) {
+                            pushToTalkPressed = false
+                            onPushToTalkPressEnd()
+                        }
+                        pttPress?.let { press ->
+                            pttInteractionSource.tryEmit(PressInteraction.Release(press))
+                        }
+                        pttPress = null
+                        true
+                    }
+                    MotionEvent.ACTION_CANCEL,
+                    MotionEvent.ACTION_OUTSIDE -> {
+                        if (pushToTalkPressed) {
+                            pushToTalkPressed = false
+                            onPushToTalkPressEnd()
+                        }
+                        pttPress?.let { press ->
+                            pttInteractionSource.tryEmit(PressInteraction.Cancel(press))
+                        }
+                        pttPress = null
+                        true
+                    }
+                    else -> true
+                }
+            }
+    } else {
+        modifier
+    }
+    FloatingActionButton(
+        onClick = if (state.pushToTalkMode) ({}) else onToggleMic,
+        modifier = pttModifier,
+        interactionSource = pttInteractionSource,
+        backgroundColor = MaterialTheme.colorScheme.primary,
+        contentColor = MaterialTheme.colorScheme.onPrimary,
+        shape = CircleShape,
+        elevation = FloatingActionButtonDefaults.elevation(
+            defaultElevation = UiTokens.FabElevation,
+            pressedElevation = 12.dp
+        )
+    ) {
+        if (state.pushToTalkMode) {
+            Crossfade(
+                targetState = pushToTalkPressed,
+                animationSpec = tween(durationMillis = 180),
+                label = "quick_subtitle_ptt_fab_icon"
+            ) { pressed ->
+                MsIcon(
+                    name = if (pressed) "settings_voice" else "mic",
+                    contentDescription = if (pressed) "按住说话中" else "按住说话",
+                    tint = MaterialTheme.colorScheme.onPrimary
+                )
+            }
+        } else {
+            MsIcon(
+                name = if (state.running) "stop" else "play_arrow",
+                contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
+                tint = MaterialTheme.colorScheme.onPrimary
+            )
+        }
+    }
+}
+
+@Composable
 fun QuickSubtitleScreen(
     viewModel: MainViewModel,
     state: UiState,
     onToggleMic: () -> Unit,
+    onPushToTalkPressStart: () -> Unit,
+    onPushToTalkPressEnd: () -> Unit,
     onOpenEditor: () -> Unit,
     fullscreenMode: Boolean
 ) {
@@ -4750,23 +5004,13 @@ fun QuickSubtitleScreen(
                                 cursorColor = MaterialTheme.colorScheme.primary
                             )
                         )
-                        FloatingActionButton(
-                            onClick = onToggleMic,
-                            modifier = Modifier.size(48.dp),
-                            backgroundColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary,
-                            shape = CircleShape,
-                            elevation = FloatingActionButtonDefaults.elevation(
-                                defaultElevation = UiTokens.FabElevation,
-                                pressedElevation = 12.dp
-                            )
-                        ) {
-                            MsIcon(
-                                name = if (state.running) "stop" else "play_arrow",
-                                contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
-                                tint = MaterialTheme.colorScheme.onPrimary
-                            )
-                        }
+                        QuickSubtitleMicFab(
+                            state = state,
+                            onToggleMic = onToggleMic,
+                            onPushToTalkPressStart = onPushToTalkPressStart,
+                            onPushToTalkPressEnd = onPushToTalkPressEnd,
+                            modifier = Modifier.size(48.dp)
+                        )
                         IconButton(
                             onClick = sendInput,
                             enabled = inputFieldValue.text.trim().isNotEmpty()
@@ -4846,27 +5090,17 @@ fun QuickSubtitleScreen(
         }
 
         if (!isLandscape) {
-            FloatingActionButton(
-                onClick = onToggleMic,
+            QuickSubtitleMicFab(
+                state = state,
+                onToggleMic = onToggleMic,
+                onPushToTalkPressStart = onPushToTalkPressStart,
+                onPushToTalkPressEnd = onPushToTalkPressEnd,
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .imePadding()
                     .navigationBarsPadding()
-                    .padding(end = 20.dp, bottom = 80.dp),
-                backgroundColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                shape = CircleShape,
-                elevation = FloatingActionButtonDefaults.elevation(
-                    defaultElevation = UiTokens.FabElevation,
-                    pressedElevation = 12.dp
-                )
-            ) {
-                MsIcon(
-                    name = if (state.running) "stop" else "play_arrow",
-                    contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
-                    tint = MaterialTheme.colorScheme.onPrimary
-                )
-            }
+                    .padding(end = 20.dp, bottom = 80.dp)
+            )
         }
     }
 }
@@ -5589,11 +5823,14 @@ private fun RecognizedQueueItemCard(item: RecognizedItem) {
 private fun RunningStatusTopStrip(
     viewModel: MainViewModel,
     status: String,
+    pushToTalkMode: Boolean,
+    pushToTalkPressed: Boolean,
     onToggleCollapsed: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val inputLevel = viewModel.realtimeInputLevel
     val playbackProgress = viewModel.realtimePlaybackProgress
+    val micIcon = if (pushToTalkMode && pushToTalkPressed) "settings_voice" else "mic"
     Surface(
         modifier = modifier,
         shape = RectangleShape,
@@ -5628,7 +5865,13 @@ private fun RunningStatusTopStrip(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                MsIcon("mic", contentDescription = "麦克风音量")
+                Crossfade(
+                    targetState = micIcon,
+                    animationSpec = tween(durationMillis = 180),
+                    label = "running_strip_panel_mic_icon"
+                ) { icon ->
+                    MsIcon(icon, contentDescription = "麦克风音量")
+                }
                 LinearProgressIndicator(
                     progress = inputLevel.coerceIn(0f, 1f),
                     modifier = Modifier.weight(1f)
@@ -5654,9 +5897,12 @@ private fun RunningStripTopBarToggle(
     micLevel: Float,
     playbackProgress: Float,
     expanded: Boolean,
+    pushToTalkMode: Boolean,
+    pushToTalkPressed: Boolean,
     contentColor: Color,
     onToggle: () -> Unit
 ) {
+    val micIcon = if (pushToTalkMode && pushToTalkPressed) "settings_voice" else "mic"
     Surface(
         modifier = Modifier
             .clip(RoundedCornerShape(4.dp))
@@ -5678,7 +5924,13 @@ private fun RunningStripTopBarToggle(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(2.dp)
             ) {
-                MsIcon("mic", contentDescription = "麦克风音量", tint = contentColor)
+                Crossfade(
+                    targetState = micIcon,
+                    animationSpec = tween(durationMillis = 180),
+                    label = "running_strip_toggle_mic_icon"
+                ) { icon ->
+                    MsIcon(icon, contentDescription = "麦克风音量", tint = contentColor)
+                }
                 LinearProgressIndicator(
                     progress = micLevel.coerceIn(0f, 1f),
                     modifier = Modifier
@@ -6835,6 +7087,17 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
                 Text("识别结果自动上屏大字幕")
             }
             Text("开启后：语音识别结果会自动更新便捷字幕主文本", style = MaterialTheme.typography.bodySmall)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Md2Switch(
+                    checked = state.pushToTalkMode,
+                    onCheckedChange = { viewModel.setPushToTalkMode(it) }
+                )
+                Text("按住说话模式")
+            }
+            Text("开启后：实时页 FAB 改为麦克风，按下开始收音，松开停止收音。", style = MaterialTheme.typography.bodySmall)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)

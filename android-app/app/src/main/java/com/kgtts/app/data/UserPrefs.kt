@@ -37,6 +37,7 @@ object UserPrefs {
     private val KEY_SOLID_TOP_BAR = booleanPreferencesKey("solid_top_bar")
     private val KEY_DRAWING_SAVE_RELATIVE_PATH = stringPreferencesKey("drawing_save_relative_path")
     private val KEY_ASR_SEND_TO_QUICK_SUBTITLE = booleanPreferencesKey("asr_send_to_quick_subtitle")
+    private val KEY_PUSH_TO_TALK_MODE = booleanPreferencesKey("push_to_talk_mode")
     private val KEY_QUICK_SUBTITLE_CONFIG = stringPreferencesKey("quick_subtitle_config")
     private val KEY_SPEAKER_VERIFY_ENABLED = booleanPreferencesKey("speaker_verify_enabled")
     private val KEY_SPEAKER_VERIFY_THRESHOLD = floatPreferencesKey("speaker_verify_threshold")
@@ -64,6 +65,7 @@ object UserPrefs {
         val solidTopBar: Boolean = true,
         val drawingSaveRelativePath: String = DEFAULT_DRAWING_SAVE_RELATIVE_PATH,
         val asrSendToQuickSubtitle: Boolean = true,
+        val pushToTalkMode: Boolean = false,
         val speakerVerifyEnabled: Boolean = false,
         val speakerVerifyThreshold: Float = 0.72f,
         val speakerVerifyProfileCsv: String = "",
@@ -105,6 +107,7 @@ object UserPrefs {
             drawingSaveRelativePath = (prefs[KEY_DRAWING_SAVE_RELATIVE_PATH]
                 ?: DEFAULT_DRAWING_SAVE_RELATIVE_PATH).ifBlank { DEFAULT_DRAWING_SAVE_RELATIVE_PATH },
             asrSendToQuickSubtitle = prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] ?: true,
+            pushToTalkMode = prefs[KEY_PUSH_TO_TALK_MODE] ?: false,
             speakerVerifyEnabled = prefs[KEY_SPEAKER_VERIFY_ENABLED] ?: false,
             speakerVerifyThreshold = (prefs[KEY_SPEAKER_VERIFY_THRESHOLD] ?: 0.72f).coerceIn(0.4f, 0.95f),
             speakerVerifyProfileCsv = prefs[KEY_SPEAKER_VERIFY_PROFILE] ?: "",
@@ -207,6 +210,12 @@ object UserPrefs {
     suspend fun setAsrSendToQuickSubtitle(context: Context, enabled: Boolean) {
         context.dataStore.edit { prefs ->
             prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] = enabled
+        }
+    }
+
+    suspend fun setPushToTalkMode(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_PUSH_TO_TALK_MODE] = enabled
         }
     }
 
