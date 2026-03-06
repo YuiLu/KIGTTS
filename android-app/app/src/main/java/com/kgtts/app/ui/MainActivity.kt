@@ -161,7 +161,6 @@ import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.DefaultItemAnimator
 import androidx.recyclerview.widget.DiffUtil
-import androidx.recyclerview.widget.ListUpdateCallback
 import androidx.recyclerview.widget.RecyclerView
 import androidx.recyclerview.widget.SimpleItemAnimator
 import androidx.navigation.NavHostController
@@ -3161,10 +3160,13 @@ private fun VoicePackRecyclerList(
                 overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
                 clipToPadding = false
                 clipChildren = false
-                // RecyclerView animator with ComposeView rows in AndroidView interop can
-                // trigger attach/detach inconsistency after repeated drag sorts.
-                // Keep drag feedback from ItemTouchHelper + card elevation animation.
-                itemAnimator = null
+                itemAnimator = DefaultItemAnimator().apply {
+                    supportsChangeAnimations = false
+                    addDuration = 120L
+                    removeDuration = 120L
+                    moveDuration = 160L
+                    changeDuration = 0L
+                }
                 setPadding(paddingLeft, topBlankPx, paddingRight, bottomBlankPx)
             }
 
@@ -3289,7 +3291,7 @@ private class VoicePackRecyclerAdapter(
         private set
 
     init {
-        setHasStableIds(false)
+        setHasStableIds(true)
     }
 
     override fun getItemId(position: Int): Long {
@@ -3419,27 +3421,18 @@ private class VoicePackRecyclerAdapter(
             }
 
             override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
-                return oldItems[oldItemPosition] == newItems[newItemPosition]
+                val old = oldItems[oldItemPosition]
+                val new = newItems[newItemPosition]
+                if (old.dir.absolutePath != new.dir.absolutePath) return false
+                // Ignore "order" in content comparison: it is persistence metadata and
+                // can change after drag commit without any visible row content change.
+                return old.meta.name == new.meta.name &&
+                        old.meta.remark == new.meta.remark &&
+                        old.meta.avatar == new.meta.avatar &&
+                        old.meta.pinned == new.meta.pinned
             }
         })
-
-        diff.dispatchUpdatesTo(object : ListUpdateCallback {
-            override fun onInserted(position: Int, count: Int) {
-                notifyItemRangeInserted(position, count)
-            }
-
-            override fun onRemoved(position: Int, count: Int) {
-                notifyItemRangeRemoved(position, count)
-            }
-
-            override fun onMoved(fromPosition: Int, toPosition: Int) {
-                notifyItemMoved(fromPosition, toPosition)
-            }
-
-            override fun onChanged(position: Int, count: Int, payload: Any?) {
-                notifyItemRangeChanged(position, count, payload)
-            }
-        })
+        diff.dispatchUpdatesTo(this)
     }
 
     fun updateCurrentVoicePath(path: String?) {
