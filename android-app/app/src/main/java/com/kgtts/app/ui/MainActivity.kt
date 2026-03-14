@@ -279,6 +279,18 @@ private fun normalizeDrawingSaveRelativePath(raw: String): String {
     }
 }
 
+private const val PLAYBACK_GAIN_SNAP_TARGET = 100
+private const val PLAYBACK_GAIN_SNAP_RANGE = 20
+
+private fun snapPlaybackGainPercent(percent: Int): Int {
+    val clamped = percent.coerceIn(0, 1000)
+    return if (kotlin.math.abs(clamped - PLAYBACK_GAIN_SNAP_TARGET) <= PLAYBACK_GAIN_SNAP_RANGE) {
+        PLAYBACK_GAIN_SNAP_TARGET
+    } else {
+        clamped
+    }
+}
+
 private fun drawingRelativePathFromTreeUri(uri: android.net.Uri): String? {
     val treeId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull() ?: return null
     val sep = treeId.indexOf(':')
@@ -1593,7 +1605,7 @@ class MainViewModel(
     }
 
     fun setPlaybackGainPercent(percent: Int) {
-        val clamped = percent.coerceIn(0, 1000)
+        val clamped = snapPlaybackGainPercent(percent)
         uiState = uiState.copy(playbackGainPercent = clamped)
         controller?.setPlaybackGainPercent(clamped)
         viewModelScope.launch {
@@ -3333,8 +3345,64 @@ private fun QuickCardScannerScreen(
             modifier = Modifier
                 .size(260.dp)
                 .align(Alignment.Center)
-                .border(BorderStroke(2.dp, Color.White), RoundedCornerShape(14.dp))
-        )
+        ) {
+            QrScannerFinderFrame(
+                modifier = Modifier.fillMaxSize(),
+                color = Color.White
+            )
+        }
+    }
+}
+
+@Composable
+private fun QrScannerFinderFrame(
+    modifier: Modifier = Modifier,
+    color: Color = Color.White
+) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val cornerRatio = 0.22f
+        val cornerW = w * cornerRatio
+        val cornerH = h * cornerRatio
+        val thick = size.minDimension * 0.018f
+        val thin = thick * 0.42f
+
+        fun hSeg(x1: Float, x2: Float, y: Float, stroke: Float) {
+            drawLine(
+                color = color,
+                start = Offset(x1, y),
+                end = Offset(x2, y),
+                strokeWidth = stroke,
+                cap = StrokeCap.Butt
+            )
+        }
+
+        fun vSeg(x: Float, y1: Float, y2: Float, stroke: Float) {
+            drawLine(
+                color = color,
+                start = Offset(x, y1),
+                end = Offset(x, y2),
+                strokeWidth = stroke,
+                cap = StrokeCap.Butt
+            )
+        }
+
+        hSeg(0f, cornerW, 0f, thick)
+        hSeg(cornerW, w - cornerW, 0f, thin)
+        hSeg(w - cornerW, w, 0f, thick)
+
+        hSeg(0f, cornerW, h, thick)
+        hSeg(cornerW, w - cornerW, h, thin)
+        hSeg(w - cornerW, w, h, thick)
+
+        vSeg(0f, 0f, cornerH, thick)
+        vSeg(0f, cornerH, h - cornerH, thin)
+        vSeg(0f, h - cornerH, h, thick)
+
+        vSeg(w, 0f, cornerH, thick)
+        vSeg(w, cornerH, h - cornerH, thin)
+        vSeg(w, h - cornerH, h, thick)
     }
 }
 
@@ -5140,6 +5208,36 @@ private fun Md2OutlinedButton(
 }
 
 @Composable
+private fun Md2DropdownButton(
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    expanded: Boolean = false
+) {
+    Md2OutlinedButton(
+        onClick = onClick,
+        modifier = modifier,
+        enabled = enabled
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = label,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            MsIcon(
+                name = if (expanded) "expand_less" else "expand_more",
+                contentDescription = null
+            )
+        }
+    }
+}
+
+@Composable
 private fun Md2TextButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -6170,6 +6268,9 @@ fun AppScaffold(viewModel: MainViewModel) {
                     status = state.status,
                     pushToTalkMode = state.pushToTalkMode,
                     pushToTalkPressed = state.pushToTalkPressed,
+                    playbackGainPercent = state.playbackGainPercent,
+                    preferredInputType = state.preferredInputType,
+                    preferredOutputType = state.preferredOutputType,
                     inputDeviceLabel = state.inputDeviceLabel,
                     outputDeviceLabel = state.outputDeviceLabel,
                     onToggleCollapsed = { runningStripCollapsed = !runningStripCollapsed },
@@ -10131,6 +10232,9 @@ private fun RunningStatusTopStrip(
     status: String,
     pushToTalkMode: Boolean,
     pushToTalkPressed: Boolean,
+    playbackGainPercent: Int,
+    preferredInputType: Int,
+    preferredOutputType: Int,
     inputDeviceLabel: String,
     outputDeviceLabel: String,
     onToggleCollapsed: () -> Unit,
@@ -10139,6 +10243,27 @@ private fun RunningStatusTopStrip(
     val inputLevel = viewModel.realtimeInputLevel
     val playbackProgress = viewModel.realtimePlaybackProgress
     val micIcon = if (pushToTalkMode && pushToTalkPressed) "settings_voice" else "mic"
+    var inputExpanded by remember { mutableStateOf(false) }
+    var outputExpanded by remember { mutableStateOf(false) }
+    val inputTypeOptions = remember {
+        listOf(
+            AudioRoutePreference.INPUT_AUTO to "自动",
+            AudioRoutePreference.INPUT_BUILTIN_MIC to "内置麦克风/话筒",
+            AudioRoutePreference.INPUT_USB to "USB 麦克风",
+            AudioRoutePreference.INPUT_BLUETOOTH to "蓝牙麦克风",
+            AudioRoutePreference.INPUT_WIRED to "有线麦克风"
+        )
+    }
+    val outputTypeOptions = remember {
+        listOf(
+            AudioRoutePreference.OUTPUT_AUTO to "自动",
+            AudioRoutePreference.OUTPUT_SPEAKER to "扬声器",
+            AudioRoutePreference.OUTPUT_EARPIECE to "听筒",
+            AudioRoutePreference.OUTPUT_BLUETOOTH to "蓝牙音频",
+            AudioRoutePreference.OUTPUT_USB to "USB 音频",
+            AudioRoutePreference.OUTPUT_WIRED to "有线耳机/线路"
+        )
+    }
     Surface(
         modifier = modifier,
         shape = RectangleShape,
@@ -10201,31 +10326,93 @@ private fun RunningStatusTopStrip(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    MsIcon("mic", contentDescription = "输入设备")
-                    Text(
-                        text = inputDeviceLabel,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                Box(modifier = Modifier.weight(1f)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = rememberRipple(bounded = true)
+                            ) { inputExpanded = true }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        MsIcon("mic", contentDescription = "输入设备")
+                        Text(
+                            text = inputDeviceLabel,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        MsIcon(
+                            name = if (inputExpanded) "expand_less" else "expand_more",
+                            contentDescription = "选择首选输入设备"
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = inputExpanded,
+                        onDismissRequest = { inputExpanded = false }
+                    ) {
+                        inputTypeOptions.forEach { (value, label) ->
+                            M2DropdownMenuItem(
+                                onClick = {
+                                    inputExpanded = false
+                                    viewModel.setPreferredInputType(value)
+                                }
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontWeight = if (value == preferredInputType) FontWeight.SemiBold else null
+                                )
+                            }
+                        }
+                    }
                 }
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    MsIcon("volume_up", contentDescription = "输出设备")
-                    Text(
-                        text = outputDeviceLabel,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                Box(modifier = Modifier.weight(1f)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = rememberRipple(bounded = true)
+                            ) { outputExpanded = true }
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        MsIcon("volume_up", contentDescription = "输出设备")
+                        Text(
+                            text = outputDeviceLabel,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        MsIcon(
+                            name = if (outputExpanded) "expand_less" else "expand_more",
+                            contentDescription = "选择首选输出设备"
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = outputExpanded,
+                        onDismissRequest = { outputExpanded = false }
+                    ) {
+                        outputTypeOptions.forEach { (value, label) ->
+                            M2DropdownMenuItem(
+                                onClick = {
+                                    outputExpanded = false
+                                    viewModel.setPreferredOutputType(value)
+                                }
+                            ) {
+                                Text(
+                                    text = label,
+                                    fontWeight = if (value == preferredOutputType) FontWeight.SemiBold else null
+                                )
+                            }
+                        }
+                    }
                 }
             }
             Row(
@@ -10243,6 +10430,20 @@ private fun RunningStatusTopStrip(
                 Md2Switch(
                     checked = pushToTalkMode,
                     onCheckedChange = { viewModel.setPushToTalkMode(it) }
+                )
+            }
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "音量倍率：${playbackGainPercent}%",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(
+                    value = playbackGainPercent.toFloat(),
+                    onValueChange = { viewModel.setPlaybackGainPercent(it.toInt()) },
+                    valueRange = 0f..1000f
                 )
             }
         }
@@ -11298,6 +11499,9 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
                         speakerEnrollMessage = "合并注册信息失败，请重录第三句"
                     } else {
                         if (viewModel.applySpeakerProfile(combined)) {
+                            if (speakerEnrollOpenedByToggle) {
+                                viewModel.setSpeakerVerifyEnabled(true)
+                            }
                             speakerEnrollSuccess = true
                             speakerEnrollStep = 4
                             speakerEnrollProgress = 1f
@@ -11365,11 +11569,13 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
             Md2SettingsCard(title = "系统与布局") {
                 Text("横屏抽屉模式", fontWeight = FontWeight.Bold)
                 Box {
-                    Md2OutlinedButton(onClick = { drawerModeExpanded = true }) {
-                        val label = drawerModeOptions.firstOrNull { it.first == state.landscapeDrawerMode }?.second
-                            ?: drawerModeOptions.first().second
-                        Text(label)
-                    }
+                    val label = drawerModeOptions.firstOrNull { it.first == state.landscapeDrawerMode }?.second
+                        ?: drawerModeOptions.first().second
+                    Md2DropdownButton(
+                        label = label,
+                        onClick = { drawerModeExpanded = true },
+                        expanded = drawerModeExpanded
+                    )
                     DropdownMenu(
                         expanded = drawerModeExpanded,
                         onDismissRequest = { drawerModeExpanded = false }
@@ -11494,7 +11700,6 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
                         } else if (state.speakerProfileReady) {
                             viewModel.setSpeakerVerifyEnabled(true)
                         } else {
-                            viewModel.setSpeakerVerifyEnabled(true)
                             speakerEnrollSamples.clear()
                             speakerEnrollStep = 0
                             speakerEnrollCountingDown = false
@@ -11606,13 +11811,13 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
                 onValueChange = { viewModel.setMinVolumePercent(it.toInt()) },
                 valueRange = 0f..100f
             )
-            Text("播放音量增益：${state.playbackGainPercent}%", style = MaterialTheme.typography.bodySmall)
+            Text("播放音量倍率：${state.playbackGainPercent}%", style = MaterialTheme.typography.bodySmall)
             Slider(
                 value = state.playbackGainPercent.toFloat(),
                 onValueChange = { viewModel.setPlaybackGainPercent(it.toInt()) },
                 valueRange = 0f..1000f
             )
-            Text("100% 为原始音量，>100% 为倍率增益", style = MaterialTheme.typography.bodySmall)
+            Text("100% 为原始音量，拖动接近 100% 时会自动吸附。", style = MaterialTheme.typography.bodySmall)
             Text("音色随机度：${String.format("%.3f", state.piperNoiseScale)}", style = MaterialTheme.typography.bodySmall)
             Slider(
                 value = state.piperNoiseScale,
@@ -11635,10 +11840,12 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
             var numberReplaceExpanded by remember { mutableStateOf(false) }
             Text("数字替换", fontWeight = FontWeight.Bold)
             Box {
-                Md2OutlinedButton(onClick = { numberReplaceExpanded = true }) {
-                    val label = numberReplaceOptions.getOrElse(state.numberReplaceMode) { numberReplaceOptions[0] }
-                    Text(label)
-                }
+                val label = numberReplaceOptions.getOrElse(state.numberReplaceMode) { numberReplaceOptions[0] }
+                Md2DropdownButton(
+                    label = label,
+                    onClick = { numberReplaceExpanded = true },
+                    expanded = numberReplaceExpanded
+                )
                 DropdownMenu(
                     expanded = numberReplaceExpanded,
                     onDismissRequest = { numberReplaceExpanded = false }
@@ -11703,11 +11910,13 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
             Md2SettingsCard(title = "设备路由") {
             Text("优先选择的音频输入设备类型", style = MaterialTheme.typography.bodySmall)
             Box {
-                Md2OutlinedButton(onClick = { inputTypeExpanded = true }) {
-                    val label = inputTypeOptions.firstOrNull { it.first == state.preferredInputType }?.second
-                        ?: inputTypeOptions.first().second
-                    Text(label)
-                }
+                val label = inputTypeOptions.firstOrNull { it.first == state.preferredInputType }?.second
+                    ?: inputTypeOptions.first().second
+                Md2DropdownButton(
+                    label = label,
+                    onClick = { inputTypeExpanded = true },
+                    expanded = inputTypeExpanded
+                )
                 DropdownMenu(
                     expanded = inputTypeExpanded,
                     onDismissRequest = { inputTypeExpanded = false }
@@ -11726,11 +11935,13 @@ fun SettingsScreen(viewModel: MainViewModel, state: UiState) {
 
             Text("优先使用的音频输出类型", style = MaterialTheme.typography.bodySmall)
             Box {
-                Md2OutlinedButton(onClick = { outputTypeExpanded = true }) {
-                    val label = outputTypeOptions.firstOrNull { it.first == state.preferredOutputType }?.second
-                        ?: outputTypeOptions.first().second
-                    Text(label)
-                }
+                val label = outputTypeOptions.firstOrNull { it.first == state.preferredOutputType }?.second
+                    ?: outputTypeOptions.first().second
+                Md2DropdownButton(
+                    label = label,
+                    onClick = { outputTypeExpanded = true },
+                    expanded = outputTypeExpanded
+                )
                 DropdownMenu(
                     expanded = outputTypeExpanded,
                     onDismissRequest = { outputTypeExpanded = false }
@@ -12000,9 +12211,11 @@ fun LogScreen(
         Md2StaggeredFloatIn(index = 0) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box {
-                    Md2OutlinedButton(onClick = { expanded = true }) {
-                        Text(selected?.name ?: "选择日志")
-                    }
+                    Md2DropdownButton(
+                        label = selected?.name ?: "选择日志",
+                        onClick = { expanded = true },
+                        expanded = expanded
+                    )
                     DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
                         logs.forEach { file ->
                             M2DropdownMenuItem(
