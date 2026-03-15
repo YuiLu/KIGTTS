@@ -1,6 +1,7 @@
 package com.kgtts.app.data
 
 import android.content.Context
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
@@ -8,7 +9,9 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.kgtts.app.audio.AudioRoutePreference
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -44,6 +47,10 @@ object UserPrefs {
     private val KEY_ASR_SEND_TO_QUICK_SUBTITLE = booleanPreferencesKey("asr_send_to_quick_subtitle")
     private val KEY_PUSH_TO_TALK_MODE = booleanPreferencesKey("push_to_talk_mode")
     private val KEY_PUSH_TO_TALK_CONFIRM_INPUT = booleanPreferencesKey("push_to_talk_confirm_input")
+    private val KEY_FLOATING_OVERLAY_ENABLED = booleanPreferencesKey("floating_overlay_enabled")
+    private val KEY_FLOATING_OVERLAY_AUTO_DOCK = booleanPreferencesKey("floating_overlay_auto_dock")
+    private val KEY_FLOATING_OVERLAY_SHORTCUTS = stringPreferencesKey("floating_overlay_shortcuts")
+    private val KEY_FLOATING_OVERLAY_LAYOUT = stringPreferencesKey("floating_overlay_layout")
     private val KEY_QUICK_SUBTITLE_CONFIG = stringPreferencesKey("quick_subtitle_config")
     private val KEY_QUICK_CARD_CONFIG = stringPreferencesKey("quick_card_config")
     private val KEY_SPEAKER_VERIFY_ENABLED = booleanPreferencesKey("speaker_verify_enabled")
@@ -79,6 +86,8 @@ object UserPrefs {
         val asrSendToQuickSubtitle: Boolean = true,
         val pushToTalkMode: Boolean = false,
         val pushToTalkConfirmInput: Boolean = false,
+        val floatingOverlayEnabled: Boolean = false,
+        val floatingOverlayAutoDock: Boolean = false,
         val speakerVerifyEnabled: Boolean = false,
         val speakerVerifyThreshold: Float = 0.72f,
         val speakerVerifyProfileCsv: String = "",
@@ -98,38 +107,48 @@ object UserPrefs {
 
     suspend fun getSettings(context: Context): AppSettings {
         val prefs = context.dataStore.data.first()
-        val legacyPreferUsb = prefs[KEY_PREFER_USB_MIC] ?: false
-        val legacySpeaker = prefs[KEY_COMMUNICATION_SPEAKER] ?: false
+        return prefs.toAppSettings()
+    }
+
+    fun observeSettings(context: Context): Flow<AppSettings> {
+        return context.dataStore.data.map { prefs -> prefs.toAppSettings() }
+    }
+
+    private fun Preferences.toAppSettings(): AppSettings {
+        val legacyPreferUsb = this[KEY_PREFER_USB_MIC] ?: false
+        val legacySpeaker = this[KEY_COMMUNICATION_SPEAKER] ?: false
         return AppSettings(
-            muteWhilePlaying = prefs[KEY_MUTE_WHILE_PLAYING] ?: false,
-            muteWhilePlayingDelaySec = prefs[KEY_MUTE_DELAY_SEC] ?: 0f,
-            echoSuppression = prefs[KEY_ECHO_SUPPRESSION] ?: false,
-            communicationMode = prefs[KEY_COMMUNICATION_MODE] ?: false,
-            preferredInputType = prefs[KEY_PREFERRED_INPUT_TYPE]
+            muteWhilePlaying = this[KEY_MUTE_WHILE_PLAYING] ?: false,
+            muteWhilePlayingDelaySec = this[KEY_MUTE_DELAY_SEC] ?: 0f,
+            echoSuppression = this[KEY_ECHO_SUPPRESSION] ?: false,
+            communicationMode = this[KEY_COMMUNICATION_MODE] ?: false,
+            preferredInputType = this[KEY_PREFERRED_INPUT_TYPE]
                 ?: if (legacyPreferUsb) AudioRoutePreference.INPUT_USB else AudioRoutePreference.INPUT_AUTO,
-            preferredOutputType = prefs[KEY_PREFERRED_OUTPUT_TYPE]
+            preferredOutputType = this[KEY_PREFERRED_OUTPUT_TYPE]
                 ?: if (legacySpeaker) AudioRoutePreference.OUTPUT_SPEAKER else AudioRoutePreference.OUTPUT_AUTO,
-            aec3Enabled = prefs[KEY_AEC3_ENABLED] ?: false,
-            minVolumePercent = prefs[KEY_MIN_VOLUME_PERCENT] ?: 0,
-            playbackGainPercent = (prefs[KEY_PLAYBACK_GAIN_PERCENT] ?: 100).coerceIn(0, 1000),
-            piperNoiseScale = (prefs[KEY_PIPER_NOISE_SCALE] ?: 0.667f).coerceIn(0f, 2f),
-            piperLengthScale = (prefs[KEY_PIPER_LENGTH_SCALE] ?: 1.0f).coerceIn(0.1f, 5f),
-            piperNoiseW = (prefs[KEY_PIPER_NOISE_W] ?: 0.8f).coerceIn(0f, 2f),
-            piperSentenceSilence = (prefs[KEY_PIPER_SENTENCE_SILENCE] ?: 0.2f).coerceIn(0f, 2f),
-            keepAlive = prefs[KEY_KEEP_ALIVE] ?: false,
-            numberReplaceMode = prefs[KEY_NUMBER_REPLACE_MODE] ?: 0,
-            landscapeDrawerMode = (prefs[KEY_LANDSCAPE_DRAWER_MODE] ?: DRAWER_MODE_PERMANENT)
+            aec3Enabled = this[KEY_AEC3_ENABLED] ?: false,
+            minVolumePercent = this[KEY_MIN_VOLUME_PERCENT] ?: 0,
+            playbackGainPercent = (this[KEY_PLAYBACK_GAIN_PERCENT] ?: 100).coerceIn(0, 1000),
+            piperNoiseScale = (this[KEY_PIPER_NOISE_SCALE] ?: 0.667f).coerceIn(0f, 2f),
+            piperLengthScale = (this[KEY_PIPER_LENGTH_SCALE] ?: 1.0f).coerceIn(0.1f, 5f),
+            piperNoiseW = (this[KEY_PIPER_NOISE_W] ?: 0.8f).coerceIn(0f, 2f),
+            piperSentenceSilence = (this[KEY_PIPER_SENTENCE_SILENCE] ?: 0.2f).coerceIn(0f, 2f),
+            keepAlive = this[KEY_KEEP_ALIVE] ?: false,
+            numberReplaceMode = this[KEY_NUMBER_REPLACE_MODE] ?: 0,
+            landscapeDrawerMode = (this[KEY_LANDSCAPE_DRAWER_MODE] ?: DRAWER_MODE_PERMANENT)
                 .coerceIn(DRAWER_MODE_HIDDEN, DRAWER_MODE_PERMANENT),
-            solidTopBar = prefs[KEY_SOLID_TOP_BAR] ?: true,
-            drawingSaveRelativePath = (prefs[KEY_DRAWING_SAVE_RELATIVE_PATH]
+            solidTopBar = this[KEY_SOLID_TOP_BAR] ?: true,
+            drawingSaveRelativePath = (this[KEY_DRAWING_SAVE_RELATIVE_PATH]
                 ?: DEFAULT_DRAWING_SAVE_RELATIVE_PATH).ifBlank { DEFAULT_DRAWING_SAVE_RELATIVE_PATH },
-            quickCardAutoSaveOnExit = prefs[KEY_QUICK_CARD_AUTO_SAVE_ON_EXIT] ?: false,
-            asrSendToQuickSubtitle = prefs[KEY_ASR_SEND_TO_QUICK_SUBTITLE] ?: true,
-            pushToTalkMode = prefs[KEY_PUSH_TO_TALK_MODE] ?: false,
-            pushToTalkConfirmInput = prefs[KEY_PUSH_TO_TALK_CONFIRM_INPUT] ?: false,
-            speakerVerifyEnabled = prefs[KEY_SPEAKER_VERIFY_ENABLED] ?: false,
-            speakerVerifyThreshold = (prefs[KEY_SPEAKER_VERIFY_THRESHOLD] ?: 0.72f).coerceIn(0.4f, 0.95f),
-            speakerVerifyProfileCsv = prefs[KEY_SPEAKER_VERIFY_PROFILE] ?: "",
+            quickCardAutoSaveOnExit = this[KEY_QUICK_CARD_AUTO_SAVE_ON_EXIT] ?: false,
+            asrSendToQuickSubtitle = this[KEY_ASR_SEND_TO_QUICK_SUBTITLE] ?: true,
+            pushToTalkMode = this[KEY_PUSH_TO_TALK_MODE] ?: false,
+            pushToTalkConfirmInput = this[KEY_PUSH_TO_TALK_CONFIRM_INPUT] ?: false,
+            floatingOverlayEnabled = this[KEY_FLOATING_OVERLAY_ENABLED] ?: false,
+            floatingOverlayAutoDock = this[KEY_FLOATING_OVERLAY_AUTO_DOCK] ?: false,
+            speakerVerifyEnabled = this[KEY_SPEAKER_VERIFY_ENABLED] ?: false,
+            speakerVerifyThreshold = (this[KEY_SPEAKER_VERIFY_THRESHOLD] ?: 0.72f).coerceIn(0.4f, 0.95f),
+            speakerVerifyProfileCsv = this[KEY_SPEAKER_VERIFY_PROFILE] ?: "",
             allowSystemAecWithAec3 = true
         )
     }
@@ -271,6 +290,18 @@ object UserPrefs {
     suspend fun setPushToTalkConfirmInput(context: Context, enabled: Boolean) {
         context.dataStore.edit { prefs ->
             prefs[KEY_PUSH_TO_TALK_CONFIRM_INPUT] = enabled
+        }
+    }
+
+    suspend fun setFloatingOverlayEnabled(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_FLOATING_OVERLAY_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setFloatingOverlayAutoDock(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_FLOATING_OVERLAY_AUTO_DOCK] = enabled
         }
     }
 
@@ -417,6 +448,28 @@ object UserPrefs {
     suspend fun setQuickSubtitleConfig(context: Context, json: String) {
         context.dataStore.edit { prefs ->
             prefs[KEY_QUICK_SUBTITLE_CONFIG] = json
+        }
+    }
+
+    suspend fun getFloatingOverlayShortcuts(context: Context): String? {
+        val prefs = context.dataStore.data.first()
+        return prefs[KEY_FLOATING_OVERLAY_SHORTCUTS]
+    }
+
+    suspend fun setFloatingOverlayShortcuts(context: Context, json: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_FLOATING_OVERLAY_SHORTCUTS] = json
+        }
+    }
+
+    suspend fun getFloatingOverlayLayout(context: Context): String? {
+        val prefs = context.dataStore.data.first()
+        return prefs[KEY_FLOATING_OVERLAY_LAYOUT]
+    }
+
+    suspend fun setFloatingOverlayLayout(context: Context, json: String) {
+        context.dataStore.edit { prefs ->
+            prefs[KEY_FLOATING_OVERLAY_LAYOUT] = json
         }
     }
 

@@ -18,6 +18,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.provider.Settings
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
@@ -179,8 +180,12 @@ import com.kgtts.app.audio.SpeakerEnrollResult
 import com.kgtts.app.data.ModelRepository
 import com.kgtts.app.data.VoicePackInfo
 import com.kgtts.app.data.UserPrefs
+import com.kgtts.app.overlay.FloatingOverlayService
+import com.kgtts.app.overlay.OverlayBridge
+import com.kgtts.app.overlay.RealtimeOwnerGate
 import com.kgtts.app.service.KeepAliveService
 import com.kgtts.app.util.AppLogger
+import com.kgtts.app.util.QuickCardRenderCache
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
@@ -188,7 +193,6 @@ import com.google.zxing.MultiFormatReader
 import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
-import com.google.zxing.qrcode.QRCodeWriter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -342,6 +346,8 @@ data class UiState(
     val asrSendToQuickSubtitle: Boolean = true,
     val pushToTalkMode: Boolean = false,
     val pushToTalkConfirmInputMode: Boolean = false,
+    val floatingOverlayEnabled: Boolean = false,
+    val floatingOverlayAutoDock: Boolean = false,
     val pushToTalkPressed: Boolean = false,
     val pushToTalkStreamingText: String = "",
     val speakerVerifyEnabled: Boolean = false,
@@ -364,6 +370,21 @@ data class RecognizedItem(
     val text: String,
     val progress: Float = 0f
 )
+
+data class ExternalQuickSubtitleRequest(
+    val requestId: Long,
+    val target: String,
+    val text: String
+)
+
+private fun isOverlayOpenTarget(target: String): Boolean {
+    return target == OverlayBridge.TARGET_OPEN ||
+            target == OverlayBridge.TARGET_OPEN_OVERLAY ||
+            target == OverlayBridge.TARGET_OPEN_QUICK_CARD ||
+            target == OverlayBridge.TARGET_OPEN_DRAWING ||
+            target == OverlayBridge.TARGET_OPEN_SETTINGS ||
+            target == OverlayBridge.TARGET_OPEN_QR_SCANNER
+}
 
 enum class PttConfirmReleaseAction {
     SendToSubtitle,
@@ -483,6 +504,8 @@ class MainViewModel(
         private set
     var realtimePlaybackProgress by mutableFloatStateOf(0f)
         private set
+    var pendingQuickSubtitleLaunchRequest by mutableStateOf<ExternalQuickSubtitleRequest?>(null)
+        private set
 
     private var controller: RealtimeController? = null
     private var restartJob: Job? = null
@@ -494,6 +517,7 @@ class MainViewModel(
     private var lastPttHistoryAtMs: Long = 0L
     private var manualRecognizedIdSeed: Long = -1L
     private var pttSessionCommitConsumed: Boolean = false
+    private var lastHandledQuickSubtitleLaunchRequestId: Long = Long.MIN_VALUE
 
     private fun mergePttTranscript(existing: String, incoming: String): String {
         val a = existing.trim()
@@ -575,6 +599,7 @@ class MainViewModel(
         private const val PROGRESS_UPDATE_DELTA = 0.02f
         private const val MAX_RECOGNIZED_ITEMS = 100
         private const val MAX_SPEAKER_PROFILES = 3
+        private const val APP_REALTIME_OWNER_TAG = "app"
     }
     val drawStrokes = mutableStateListOf<DrawStrokeData>()
     var drawColor by mutableStateOf(UiTokens.Primary)
@@ -753,6 +778,54 @@ class MainViewModel(
             uiState = uiState.copy(status = "已更新字幕文本")
         }
         saveQuickSubtitleConfig()
+    }
+
+    fun handleQuickSubtitleLaunchRequest(
+        requestId: Long,
+        target: String,
+        text: String
+    ) {
+        val normalized = text.trim()
+        if (requestId == lastHandledQuickSubtitleLaunchRequestId) return
+        if (!isOverlayOpenTarget(target) && normalized.isEmpty()) return
+        lastHandledQuickSubtitleLaunchRequestId = requestId
+        pendingQuickSubtitleLaunchRequest = ExternalQuickSubtitleRequest(
+            requestId = requestId,
+            target = target,
+            text = normalized
+        )
+    }
+
+    fun consumeQuickSubtitleLaunchRequest(requestId: Long) {
+        if (pendingQuickSubtitleLaunchRequest?.requestId == requestId) {
+            pendingQuickSubtitleLaunchRequest = null
+        }
+    }
+
+    fun applyExternalQuickSubtitleRequest(target: String, text: String) {
+        val normalized = text.trim()
+        when (target) {
+            OverlayBridge.TARGET_OPEN -> {
+                loadQuickSubtitleConfig()
+            }
+            OverlayBridge.TARGET_INPUT -> {
+                if (normalized.isEmpty()) return
+                appendRecognizedHistory(normalized)
+                quickSubtitleInputCollapsed = false
+                quickSubtitleInputText = normalized
+                saveQuickSubtitleConfig()
+            }
+            else -> {
+                if (normalized.isEmpty()) return
+                if (!quickSubtitlePlayOnSend) {
+                    appendRecognizedHistory(normalized)
+                    applyQuickSubtitleText(normalized, enqueueSpeak = false)
+                } else {
+                    applyQuickSubtitleText(normalized, enqueueSpeak = false)
+                    enqueuePttSpeakAndAppendHistory(normalized)
+                }
+            }
+        }
     }
 
     fun setQuickSubtitleFontSize(size: Float) {
@@ -971,6 +1044,7 @@ class MainViewModel(
             0,
             quickCards.lastIndex.coerceAtLeast(0)
         )
+        prefetchQuickCardAssets()
     }
 
     private fun saveQuickCardConfig() {
@@ -1003,6 +1077,7 @@ class MainViewModel(
                 quickCardsSaving = false
             }
         }
+        prefetchQuickCardAssets()
     }
 
     fun updateQuickCardSelectedIndex(index: Int) {
@@ -1012,6 +1087,7 @@ class MainViewModel(
         }
         quickCardSelectedIndex = index.coerceIn(0, quickCards.lastIndex)
         saveQuickCardConfig()
+        prefetchQuickCardAssets()
     }
 
     fun reorderQuickCardsByIds(orderedIds: List<Long>) {
@@ -1037,6 +1113,7 @@ class MainViewModel(
             ?.takeIf { it >= 0 }
             ?: 0
         saveQuickCardConfig()
+        prefetchQuickCardAssets()
     }
 
     fun getQuickCard(id: Long): QuickCard? {
@@ -1073,6 +1150,21 @@ class MainViewModel(
     private fun normalizeQuickCardColor(raw: String): String {
         val v = raw.trim()
         return if (Regex("^#[0-9a-fA-F]{6}$").matches(v)) v.lowercase(Locale.US) else "#038387"
+    }
+
+    private fun prefetchQuickCardAssets() {
+        val cardsSnapshot = quickCards
+        if (cardsSnapshot.isEmpty()) return
+        val selected = quickCardSelectedIndex.coerceIn(0, cardsSnapshot.lastIndex)
+        val candidateIndices = listOf(selected, selected - 1, selected + 1).distinct()
+        viewModelScope.launch(Dispatchers.IO) {
+            candidateIndices.forEach { index ->
+                val card = cardsSnapshot.getOrNull(index) ?: return@forEach
+                card.portraitImagePath.takeIf { it.isNotBlank() }?.let { QuickCardRenderCache.loadImage(it) }
+                card.landscapeImagePath.takeIf { it.isNotBlank() }?.let { QuickCardRenderCache.loadImage(it) }
+                card.link.takeIf { it.isNotBlank() }?.let { QuickCardRenderCache.loadQr(it) }
+            }
+        }
     }
 
     private fun normalizeQuickCardType(draft: QuickCardDraft): QuickCardType {
@@ -1437,6 +1529,8 @@ class MainViewModel(
                 asrSendToQuickSubtitle = settings.asrSendToQuickSubtitle,
                 pushToTalkMode = settings.pushToTalkMode,
                 pushToTalkConfirmInputMode = settings.pushToTalkConfirmInput,
+                floatingOverlayEnabled = settings.floatingOverlayEnabled,
+                floatingOverlayAutoDock = settings.floatingOverlayAutoDock,
                 speakerVerifyEnabled = speakerVerifyEnabled,
                 speakerVerifyThreshold = settings.speakerVerifyThreshold,
                 speakerProfileReady = hasProfiles,
@@ -1465,6 +1559,9 @@ class MainViewModel(
             uiState = uiState.copy(voiceDir = dir, status = "音色包导入完成")
             preloadTts(dir)
             refreshVoicePacks()
+            if (uiState.floatingOverlayEnabled) {
+                FloatingOverlayService.refresh(appContext)
+            }
         }
     }
 
@@ -1474,6 +1571,9 @@ class MainViewModel(
             uiState = uiState.copy(voiceDir = dir, status = "已选择音色包")
             preloadTts(dir)
             refreshVoicePacks()
+            if (uiState.floatingOverlayEnabled) {
+                FloatingOverlayService.refresh(appContext)
+            }
         }
     }
 
@@ -1708,6 +1808,20 @@ class MainViewModel(
         controller?.setSuppressAsrAutoSpeak(enabled && uiState.pushToTalkMode)
         viewModelScope.launch {
             UserPrefs.setPushToTalkConfirmInput(appContext, enabled)
+        }
+    }
+
+    fun setFloatingOverlayEnabled(enabled: Boolean) {
+        uiState = uiState.copy(floatingOverlayEnabled = enabled)
+        viewModelScope.launch {
+            UserPrefs.setFloatingOverlayEnabled(appContext, enabled)
+        }
+    }
+
+    fun setFloatingOverlayAutoDock(enabled: Boolean) {
+        uiState = uiState.copy(floatingOverlayAutoDock = enabled)
+        viewModelScope.launch {
+            UserPrefs.setFloatingOverlayAutoDock(appContext, enabled)
         }
     }
 
@@ -2222,6 +2336,10 @@ class MainViewModel(
             uiState = uiState.copy(status = "请先导入 ASR 模型和 voicepack")
             return
         }
+        if (!RealtimeOwnerGate.acquire(APP_REALTIME_OWNER_TAG)) {
+            uiState = uiState.copy(status = "麦克风已被悬浮窗占用")
+            return
+        }
         restartJob?.cancel()
         restartJob = null
         val activeController = ensureController()
@@ -2242,6 +2360,7 @@ class MainViewModel(
                     KeepAliveService.start(appContext)
                 }
             } else {
+                RealtimeOwnerGate.release(APP_REALTIME_OWNER_TAG)
                 realtimeInputLevel = 0f
                 realtimePlaybackProgress = 0f
                 KeepAliveService.stop(appContext)
@@ -2258,6 +2377,7 @@ class MainViewModel(
         pttSessionLastText = ""
         resetPttHistoryDedup()
         val activeController = controller ?: run {
+            RealtimeOwnerGate.release(APP_REALTIME_OWNER_TAG)
             uiState = uiState.copy(
                 running = false,
                 status = "麦克风已停止",
@@ -2270,6 +2390,7 @@ class MainViewModel(
             withContext(Dispatchers.IO) {
                 activeController.stopMic()
             }
+            RealtimeOwnerGate.release(APP_REALTIME_OWNER_TAG)
             KeepAliveService.stop(appContext)
             realtimeInputLevel = 0f
             realtimePlaybackProgress = 0f
@@ -2292,6 +2413,7 @@ class MainViewModel(
                 }
             }
         }
+        RealtimeOwnerGate.release(APP_REALTIME_OWNER_TAG)
         super.onCleared()
     }
 
@@ -2472,6 +2594,7 @@ private val Md2Shapes = Shapes(
 private fun QuickCardNavHost(
     navController: NavHostController,
     viewModel: MainViewModel,
+    onNavReady: () -> Unit,
     onTopBarActionsChange: (QuickCardTopBarActions?) -> Unit
 ) {
     NavHost(
@@ -2605,6 +2728,9 @@ private fun QuickCardNavHost(
                 onTopBarActionsChange = onTopBarActionsChange
             )
         }
+    }
+    LaunchedEffect(navController) {
+        onNavReady()
     }
 }
 
@@ -4035,7 +4161,7 @@ private fun QuickCardHeroArea(
     val linkText = card.link.trim()
     val imagePath = card.heroImagePath(landscape)
     val imageBitmap = rememberQuickCardBitmap(imagePath)
-    val qrBitmap = remember(linkText) { generateQuickCardQrBitmap(linkText) }
+    val qrBitmap = rememberQuickCardQrBitmap(linkText)
     val showLinkShare = linkText.isNotEmpty() && (card.type == QuickCardType.Qr || card.type == QuickCardType.Text)
     val showImageLinkActions = card.type == QuickCardType.Image && linkText.isNotEmpty()
 
@@ -5086,6 +5212,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        handleLaunchIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
     }
 
     override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean) {
@@ -5120,6 +5253,7 @@ class MainActivity : ComponentActivity() {
             "MainActivity.onResume inMultiWindow=${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) isInMultiWindowMode else false} " +
                     "decorFits=$lastDecorFitsSystemWindows softInput=${softInputModeSummary(window.attributes.softInputMode)}"
         )
+        syncFloatingOverlayState()
     }
 
     override fun onPause() {
@@ -5152,6 +5286,29 @@ class MainActivity : ComponentActivity() {
             "applyWindowInsetPolicyForMode inMultiWindow=$inMultiWindow " +
                     "decorFits=$lastDecorFitsSystemWindows softInput=${softInputModeSummary(window.attributes.softInputMode)}"
         )
+    }
+
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent?.action != OverlayBridge.ACTION_OPEN_QUICK_SUBTITLE) return
+        val requestId = intent.getLongExtra(OverlayBridge.EXTRA_REQUEST_ID, Long.MIN_VALUE)
+        if (requestId == Long.MIN_VALUE) return
+        val target = intent.getStringExtra(OverlayBridge.EXTRA_TARGET) ?: OverlayBridge.TARGET_SUBTITLE
+        val text = intent.getStringExtra(OverlayBridge.EXTRA_TEXT).orEmpty()
+        viewModel.handleQuickSubtitleLaunchRequest(requestId, target, text)
+    }
+
+    private fun syncFloatingOverlayState() {
+        val enabled = viewModel.uiState.floatingOverlayEnabled
+        if (!enabled) {
+            FloatingOverlayService.stop(this)
+            return
+        }
+        if (!FloatingOverlayService.canDrawOverlays(this)) {
+            viewModel.setFloatingOverlayEnabled(false)
+            FloatingOverlayService.stop(this)
+            return
+        }
+        FloatingOverlayService.start(this)
     }
 }
 
@@ -5337,7 +5494,7 @@ private fun Md2OutlinedField(
 @OptIn(ExperimentalComposeUiApi::class)
 fun AppScaffold(viewModel: MainViewModel) {
     val pageQuickSubtitle = 0
-    val pageRealtime = 1
+    val pageOverlay = 1
     val pageQuickCard = 2
     val pageVoicePack = 3
     val pageDrawing = 4
@@ -5350,6 +5507,8 @@ fun AppScaffold(viewModel: MainViewModel) {
     var logTopBarActions by remember { mutableStateOf<LogTopBarActions?>(null) }
     var quickCardTopBarActions by remember { mutableStateOf<QuickCardTopBarActions?>(null) }
     var quickCardWebMenuExpanded by rememberSaveable { mutableStateOf(false) }
+    var quickCardNavReady by remember { mutableStateOf(false) }
+    var pendingQuickCardOverlayTarget by rememberSaveable { mutableStateOf<String?>(null) }
     val quickSubtitleNavController = rememberNavController()
     val quickCardNavController = rememberNavController()
     val settingsNavController = rememberNavController()
@@ -5454,11 +5613,13 @@ fun AppScaffold(viewModel: MainViewModel) {
     val topPlaybackProgress = viewModel.realtimePlaybackProgress
     val drawerItems = listOf(
         DrawerItem(pageQuickSubtitle, "便捷字幕", "subtitles"),
-        DrawerItem(pageQuickCard, "快捷名片", "badge"),
+        DrawerItem(pageOverlay, "悬浮窗", "open_in_new"),
+        DrawerItem(pageQuickCard, "快捷名片", "id_card"),
         DrawerItem(pageVoicePack, "语音包", "record_voice_over"),
         DrawerItem(pageDrawing, "画板", "draw"),
         DrawerItem(pageSettings, "设置", "tune")
     )
+    val pendingQuickSubtitleLaunchRequest = viewModel.pendingQuickSubtitleLaunchRequest
     val drawerSelectedPage = basePage
     LaunchedEffect(drawerItems.size) {
         val validPages = drawerItems.map { it.page }.toSet()
@@ -5476,9 +5637,87 @@ fun AppScaffold(viewModel: MainViewModel) {
             quickCardNavController.popBackStack(QuickCardRoutes.Main, inclusive = false)
         }
     }
+    LaunchedEffect(basePage) {
+        if (basePage != pageQuickCard) {
+            quickCardNavReady = false
+        }
+    }
     LaunchedEffect(basePage, quickCardWebOpen) {
         if (basePage != pageQuickCard || !quickCardWebOpen) {
             quickCardWebMenuExpanded = false
+        }
+    }
+    LaunchedEffect(basePage, quickCardNavReady, pendingQuickCardOverlayTarget, quickCardRoute) {
+        if (basePage != pageQuickCard || !quickCardNavReady) return@LaunchedEffect
+        when (pendingQuickCardOverlayTarget) {
+            OverlayBridge.TARGET_OPEN_QUICK_CARD -> {
+                if (quickCardRoute != QuickCardRoutes.Main) {
+                    quickCardNavController.popBackStack(QuickCardRoutes.Main, inclusive = false)
+                }
+                pendingQuickCardOverlayTarget = null
+            }
+            OverlayBridge.TARGET_OPEN_QR_SCANNER -> {
+                if (quickCardRoute != QuickCardRoutes.Main &&
+                    quickCardRoute != QuickCardRoutes.Scanner
+                ) {
+                    quickCardNavController.popBackStack(QuickCardRoutes.Main, inclusive = false)
+                }
+                if (quickCardRoute != QuickCardRoutes.Scanner) {
+                    quickCardNavController.navigate(QuickCardRoutes.Scanner) {
+                        launchSingleTop = true
+                    }
+                }
+                pendingQuickCardOverlayTarget = null
+            }
+        }
+    }
+    LaunchedEffect(pendingQuickSubtitleLaunchRequest?.requestId) {
+        val request = pendingQuickSubtitleLaunchRequest ?: return@LaunchedEffect
+        when (request.target) {
+            OverlayBridge.TARGET_OPEN_OVERLAY -> {
+                page = pageOverlay
+            }
+            OverlayBridge.TARGET_OPEN_QUICK_CARD -> {
+                page = pageQuickCard
+                pendingQuickCardOverlayTarget = request.target
+            }
+            OverlayBridge.TARGET_OPEN_QR_SCANNER -> {
+                page = pageQuickCard
+                pendingQuickCardOverlayTarget = request.target
+            }
+            OverlayBridge.TARGET_OPEN_DRAWING -> {
+                page = pageDrawing
+            }
+            OverlayBridge.TARGET_OPEN_SETTINGS -> {
+                page = pageSettings
+                if (settingsRoute != SettingsRoutes.Main) {
+                    settingsNavController.popBackStack(SettingsRoutes.Main, inclusive = false)
+                }
+            }
+            else -> {
+                quickSubtitleFullscreen = false
+                if (page != pageQuickSubtitle) {
+                    page = pageQuickSubtitle
+                }
+                if (quickSubtitleRoute != QuickSubtitleRoutes.Main) {
+                    quickSubtitleNavController.popBackStack(QuickSubtitleRoutes.Main, inclusive = false)
+                }
+                viewModel.applyExternalQuickSubtitleRequest(request.target, request.text)
+            }
+        }
+        viewModel.consumeQuickSubtitleLaunchRequest(request.requestId)
+        if (!usePermanentDrawer) {
+            drawerState.close()
+        }
+    }
+    LaunchedEffect(state.floatingOverlayEnabled) {
+        if (!state.floatingOverlayEnabled) {
+            FloatingOverlayService.stop(context)
+        } else if (FloatingOverlayService.canDrawOverlays(context)) {
+            FloatingOverlayService.start(context)
+        } else {
+            viewModel.setFloatingOverlayEnabled(false)
+            FloatingOverlayService.stop(context)
         }
     }
     LaunchedEffect(basePage, settingsRoute) {
@@ -5633,8 +5872,7 @@ fun AppScaffold(viewModel: MainViewModel) {
         }
     }
     var realtimePttDragTarget by remember { mutableStateOf(PttConfirmDragTarget.DefaultSend) }
-    val realtimeConfirmOverlayEnabled =
-        basePage == pageRealtime && state.pushToTalkMode && state.pushToTalkConfirmInputMode
+    val realtimeConfirmOverlayEnabled = false
     val realtimeShowPttConfirmOverlay =
         realtimeConfirmOverlayEnabled && state.pushToTalkPressed
     val realtimePttFabSize = 56.dp
@@ -5713,6 +5951,7 @@ fun AppScaffold(viewModel: MainViewModel) {
         } else {
             when (basePage) {
                 pageQuickSubtitle -> "便捷字幕"
+                pageOverlay -> "悬浮窗"
                 pageQuickCard -> "快捷名片"
                 pageVoicePack -> "语音包"
                 pageDrawing -> "画板"
@@ -6138,39 +6377,7 @@ fun AppScaffold(viewModel: MainViewModel) {
         }
     }
 
-    val fab: @Composable () -> Unit = {
-        if (basePage == pageRealtime) {
-            if (state.pushToTalkMode) {
-                QuickSubtitleMicFab(
-                    state = state,
-                    compactPttSideButtonsMode = realtimeCompactPttSideButtonsMode,
-                    enableInputAction = false,
-                    onToggleMic = onToggleRun,
-                    onPushToTalkPressStart = onPushToTalkPressStart,
-                    onPushToTalkPressEnd = onPushToTalkPressEnd,
-                    onPttDragTargetChanged = { realtimePttDragTarget = it },
-                    modifier = Modifier.size(realtimePttFabSize)
-                )
-            } else {
-                FloatingActionButton(
-                    onClick = onToggleRun,
-                    backgroundColor = MaterialTheme.colorScheme.primary,
-                    contentColor = MaterialTheme.colorScheme.onPrimary,
-                    shape = CircleShape,
-                    elevation = FloatingActionButtonDefaults.elevation(
-                        defaultElevation = UiTokens.FabElevation,
-                        pressedElevation = 12.dp
-                    )
-                ) {
-                    MsIcon(
-                        name = if (state.running) "stop" else "play_arrow",
-                        contentDescription = if (state.running) "关闭麦克风" else "开启麦克风",
-                        tint = MaterialTheme.colorScheme.onPrimary
-                    )
-                }
-            }
-        }
-    }
+    val fab: @Composable () -> Unit = {}
 
     val contentArea: @Composable (Modifier) -> Unit = { modifier ->
         Box(modifier = modifier.fillMaxSize()) {
@@ -6193,7 +6400,16 @@ fun AppScaffold(viewModel: MainViewModel) {
                 label = "page_switch"
             ) { current ->
                 when (current) {
-                    pageRealtime -> RealtimeScreen(viewModel)
+                    pageOverlay -> FloatingOverlayScreen(
+                        viewModel = viewModel,
+                        state = state,
+                        onOpenMainSettings = {
+                            page = pageSettings
+                            if (settingsRoute != SettingsRoutes.Main) {
+                                settingsNavController.popBackStack(SettingsRoutes.Main, inclusive = false)
+                            }
+                        }
+                    )
                     pageQuickSubtitle -> QuickSubtitleNavHost(
                         navController = quickSubtitleNavController,
                         viewModel = viewModel,
@@ -6211,6 +6427,7 @@ fun AppScaffold(viewModel: MainViewModel) {
                     pageQuickCard -> QuickCardNavHost(
                         navController = quickCardNavController,
                         viewModel = viewModel,
+                        onNavReady = { quickCardNavReady = true },
                         onTopBarActionsChange = { quickCardTopBarActions = it }
                     )
                     pageVoicePack -> VoicePackScreen(viewModel, state)
@@ -7732,28 +7949,24 @@ private fun shareQuickCard(context: Context, card: QuickCard, landscape: Boolean
 }
 
 private fun generateQuickCardQrBitmap(content: String, sizePx: Int = 640): Bitmap? {
-    val text = content.trim()
-    if (text.isEmpty()) return null
-    return runCatching {
-        val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, sizePx, sizePx)
-        val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
-        for (x in 0 until sizePx) {
-            for (y in 0 until sizePx) {
-                bmp.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
-            }
-        }
-        bmp
-    }.getOrNull()
+    return QuickCardRenderCache.loadQr(content, sizePx)
 }
 
 @Composable
 private fun rememberQuickCardBitmap(path: String): Bitmap? {
     val bitmap by produceState<Bitmap?>(initialValue = null, key1 = path) {
         value = withContext(Dispatchers.IO) {
-            if (path.isBlank()) return@withContext null
-            val file = File(path)
-            if (!file.exists()) return@withContext null
-            BitmapFactory.decodeFile(file.absolutePath)
+            QuickCardRenderCache.loadImage(path)
+        }
+    }
+    return bitmap
+}
+
+@Composable
+private fun rememberQuickCardQrBitmap(content: String): Bitmap? {
+    val bitmap by produceState<Bitmap?>(initialValue = null, key1 = content) {
+        value = withContext(Dispatchers.Default) {
+            QuickCardRenderCache.loadQr(content)
         }
     }
     return bitmap
@@ -10194,6 +10407,244 @@ fun RealtimeScreen(viewModel: MainViewModel) {
                 )
             }
         }
+    }
+}
+
+@Composable
+fun FloatingOverlayScreen(
+    viewModel: MainViewModel,
+    state: UiState,
+    onOpenMainSettings: () -> Unit
+) {
+    val context = LocalContext.current
+    val scroll = rememberScrollState()
+    val overlayPermissionGranted = remember { mutableStateOf(FloatingOverlayService.canDrawOverlays(context)) }
+    var pendingOverlayPermissionEnable by remember { mutableStateOf(false) }
+    var inputTypeExpanded by remember { mutableStateOf(false) }
+    var outputTypeExpanded by remember { mutableStateOf(false) }
+    val inputTypeOptions = remember {
+        listOf(
+            AudioRoutePreference.INPUT_AUTO to "自动",
+            AudioRoutePreference.INPUT_BUILTIN_MIC to "内置麦克风/话筒",
+            AudioRoutePreference.INPUT_USB to "USB 麦克风",
+            AudioRoutePreference.INPUT_BLUETOOTH to "蓝牙麦克风",
+            AudioRoutePreference.INPUT_WIRED to "有线麦克风"
+        )
+    }
+    val outputTypeOptions = remember {
+        listOf(
+            AudioRoutePreference.OUTPUT_AUTO to "自动",
+            AudioRoutePreference.OUTPUT_SPEAKER to "扬声器",
+            AudioRoutePreference.OUTPUT_EARPIECE to "听筒",
+            AudioRoutePreference.OUTPUT_BLUETOOTH to "蓝牙音频",
+            AudioRoutePreference.OUTPUT_USB to "USB 音频",
+            AudioRoutePreference.OUTPUT_WIRED to "有线耳机/线路"
+        )
+    }
+    val overlayPermissionLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            val granted = FloatingOverlayService.canDrawOverlays(context)
+            overlayPermissionGranted.value = granted
+            if (granted && pendingOverlayPermissionEnable) {
+                viewModel.setFloatingOverlayEnabled(true)
+                FloatingOverlayService.start(context)
+            } else if (!granted) {
+                viewModel.setFloatingOverlayEnabled(false)
+                FloatingOverlayService.stop(context)
+                toast(context, "需要悬浮窗权限")
+            }
+            pendingOverlayPermissionEnable = false
+        }
+
+    LaunchedEffect(Unit) {
+        overlayPermissionGranted.value = FloatingOverlayService.canDrawOverlays(context)
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp)
+            .verticalScroll(scroll),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(Modifier.height(UiTokens.PageTopBlank))
+
+        Md2StaggeredFloatIn(index = 0) {
+            Md2SettingsCard(title = "悬浮窗状态") {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Md2Switch(
+                        checked = state.floatingOverlayEnabled,
+                        onCheckedChange = { enabled ->
+                            if (!enabled) {
+                                pendingOverlayPermissionEnable = false
+                                viewModel.setFloatingOverlayEnabled(false)
+                                FloatingOverlayService.stop(context)
+                            } else if (overlayPermissionGranted.value) {
+                                viewModel.setFloatingOverlayEnabled(true)
+                                FloatingOverlayService.start(context)
+                            } else {
+                                pendingOverlayPermissionEnable = true
+                                overlayPermissionLauncher.launch(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:${context.packageName}")
+                                    )
+                                )
+                            }
+                        }
+                    )
+                    Text("启用独立悬浮窗")
+                }
+                Text(
+                    "权限状态：${if (overlayPermissionGranted.value) "已授权" else "未授权"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "运行状态：${if (state.floatingOverlayEnabled && overlayPermissionGranted.value) "已启用" else "未启用"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Md2OutlinedButton(
+                        onClick = {
+                            pendingOverlayPermissionEnable = false
+                            overlayPermissionLauncher.launch(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                            )
+                        }
+                    ) {
+                        Text("打开权限设置")
+                    }
+                    Md2TextButton(
+                        onClick = { FloatingOverlayService.refresh(context) },
+                        enabled = state.floatingOverlayEnabled && overlayPermissionGranted.value
+                    ) {
+                        Text("刷新悬浮窗")
+                    }
+                }
+                Text(
+                    "悬浮窗可吸附到屏幕边缘，并可在软件外直接触发快捷字幕输入。",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Md2Switch(
+                        checked = state.floatingOverlayAutoDock,
+                        onCheckedChange = { viewModel.setFloatingOverlayAutoDock(it) }
+                    )
+                    Text("长时间不操作时自动贴边")
+                }
+                Text(
+                    "开启后，悬浮 FAB 在 3 秒无操作时会自动吸附到屏幕边缘，仅露出半边并降低透明度。",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+
+        Md2StaggeredFloatIn(index = 1) {
+            Md2SettingsCard(title = "交互模式") {
+                Text(
+                    "以下交互设置与主设置页完全同步，这里仅显示当前状态，不再提供第二套独立开关。",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "按住说话模式：${if (state.pushToTalkMode) "已开启" else "未开启"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "按下输入文本确认：${
+                        if (state.pushToTalkMode && state.pushToTalkConfirmInputMode) "已开启"
+                        else if (state.pushToTalkMode) "未开启"
+                        else "按住说话未开启"
+                    }",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "保持后台运行：${if (state.keepAlive) "已开启" else "未开启"}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(8.dp))
+                Md2OutlinedButton(onClick = onOpenMainSettings) {
+                    Text("前往主设置修改")
+                }
+            }
+        }
+
+        Md2StaggeredFloatIn(index = 2) {
+            Md2SettingsCard(title = "音频与设备") {
+                Text("播放音量倍率：${state.playbackGainPercent}%", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = state.playbackGainPercent.toFloat(),
+                    onValueChange = { viewModel.setPlaybackGainPercent(it.toInt()) },
+                    valueRange = 0f..1000f
+                )
+                Text("100% 为原始音量，拖动接近 100% 时会自动吸附。", style = MaterialTheme.typography.bodySmall)
+
+                Text("首选输入设备类型", fontWeight = FontWeight.Bold)
+                Box {
+                    val label = inputTypeOptions.firstOrNull { it.first == state.preferredInputType }?.second
+                        ?: inputTypeOptions.first().second
+                    Md2DropdownButton(
+                        label = label,
+                        onClick = { inputTypeExpanded = true },
+                        expanded = inputTypeExpanded
+                    )
+                    DropdownMenu(
+                        expanded = inputTypeExpanded,
+                        onDismissRequest = { inputTypeExpanded = false }
+                    ) {
+                        inputTypeOptions.forEach { (value, label) ->
+                            M2DropdownMenuItem(
+                                onClick = {
+                                    inputTypeExpanded = false
+                                    viewModel.setPreferredInputType(value)
+                                }
+                            ) { Text(label) }
+                        }
+                    }
+                }
+                Text("当前输入设备：${state.inputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+
+                Text("首选输出设备类型", fontWeight = FontWeight.Bold)
+                Box {
+                    val label = outputTypeOptions.firstOrNull { it.first == state.preferredOutputType }?.second
+                        ?: outputTypeOptions.first().second
+                    Md2DropdownButton(
+                        label = label,
+                        onClick = { outputTypeExpanded = true },
+                        expanded = outputTypeExpanded
+                    )
+                    DropdownMenu(
+                        expanded = outputTypeExpanded,
+                        onDismissRequest = { outputTypeExpanded = false }
+                    ) {
+                        outputTypeOptions.forEach { (value, label) ->
+                            M2DropdownMenuItem(
+                                onClick = {
+                                    outputTypeExpanded = false
+                                    viewModel.setPreferredOutputType(value)
+                                }
+                            ) { Text(label) }
+                        }
+                    }
+                }
+                Text("当前输出设备：${state.outputDeviceLabel}", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+
+        Spacer(Modifier.height(UiTokens.PageBottomBlank))
     }
 }
 
